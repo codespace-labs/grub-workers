@@ -1,594 +1,423 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { upsertVenue } from "../_shared/venue-upsert.ts";
+import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
+import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
+import { isMusicalEvent }               from "../_shared/music-filter.ts";
+import {
+  extractMinPriceFromMarkdown,
+  emptySyncResult,
+  toEventRow,
+  type UnifiedEvent,
+  type SyncResult,
+} from "../_shared/normalizer.ts";
+import { upsertVenue }            from "../_shared/venue-upsert.ts";
 import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
 } from "../_shared/location-normalization.ts";
 
-// ─── Env ──────────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")              ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+const LISTING_URL      = "https://teleticket.com.pe/conciertos";
+const SOURCE           = "teleticket" as const;
+const SCRAPER_VERSION  = "2026-03-19.1";
+
+/**
+ * Máximo de páginas de detalle por run.
+ * 0  → solo listing, inserta todo sin precio/hora (para el primer run masivo).
+ * 5  → enriquece 5 eventos por run (modo cron diario, seguro dentro del timeout).
+ * Controlar también vía body: { "detailLimit": 5 }
+ */
+const DETAIL_BATCH_LIMIT = 0;
+/** Delay entre páginas de detalle para no sobrecargar Teleticket. */
+const DETAIL_THROTTLE_MS = 800;
 
 // ─── Supabase client ──────────────────────────────────────────────────────────
 
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const TELETICKET_BASE_URL = "https://teleticket.com.pe/conciertos";
-const SOURCE              = "teleticket";
-const SCRAPER_VERSION     = "2026-03-18.4";
-const MIN_VALID_PRICE_PEN = 30;
-const DETAIL_BATCH_LIMIT  = 100;   // max events enriched per run (per page)
-const DETAIL_THROTTLE_MS  = 500;   // ms between detail page fetches
-
-// ─── Helper ───────────────────────────────────────────────────────────────────
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type UpsertOutcome = "inserted" | "updated" | "failed";
-
-interface SyncResult {
-  inserted: number;
-  updated:  number;
-  failed:   number;
-}
-
-interface RawEvent {
-  name:       string;
-  date:       string | null;
-  venue:      string | null;
-  ticket_url: string;
-  cover_url:  string | null;
-  price_min:  number | null;
-  start_time: string | null;
-}
-
-interface EventDetail {
-  start_time: string | null;
-  price_min:  number | null;
-}
-
-interface FetchPageResult {
-  html: string;
-  status: number | null;
-}
-
-interface ParsedEventDate {
-  isoDate: string;
-  startsAt: string;
-}
-
-interface ListingDiagnostics {
-  totalArticles: number;
-  paginatorPages: number;
-}
-
-// ── Supabase row shape ────────────────────────────────────────────────────────
-
-interface EventRow {
+interface ListingEvent {
   name:        string;
-  date:        string | null;
-  venue:       string | null;
-  venue_id:    string | null;
-  city:        string;
-  country_code:string;
-  ticket_url:  string;
+  venue_raw:   string | null;   // "VENUE - DISTRICT - CITY" tal como viene del listing
+  category:    string;          // "Música" | "Teatro" | etc.
+  date_raw:    string;          // "24 de mayo 2026" o "27 de marzo 2026 - 28 de marzo 2026"
   cover_url:   string | null;
-  price_min:   number | null;
-  price_max:   null;
-  start_time:  string | null;
-  lineup:      string[];
-  description: null;
-  is_active:   boolean;
-  source:      string;
+  ticket_url:  string;
+  slug:        string;          // "the-killers-lima-2026"
 }
 
-// ─── Scraper ──────────────────────────────────────────────────────────────────
-
-/** Fetches the HTML of a Teleticket page and preserves HTTP status for callers. */
-async function fetchTeleticketPage(url: string): Promise<FetchPageResult> {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":      "Mozilla/5.0 (compatible; grub-scraper/1.0; +https://grub.app)",
-        "Accept":          "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-PE,es;q=0.9,en;q=0.7",
-      },
-    });
-
-    if (!res.ok) {
-      console.error(`[fetchTeleticketPage] HTTP ${res.status} ${res.statusText} — ${url}`);
-      return { html: "", status: res.status };
-    }
-
-    return { html: await res.text(), status: res.status };
-  } catch (err) {
-    console.error("[fetchTeleticketPage] network error:", err);
-    return { html: "", status: null };
-  }
+interface DetailData {
+  start_time: string | null;    // "HH:MM:SS"
+  price_min:  number | null;    // S/ validado
+  venue_raw:  string | null;    // del campo "Recinto:" si existe
 }
 
-// ── HTML helpers ──────────────────────────────────────────────────────────────
+// ─── Listing parser ───────────────────────────────────────────────────────────
+//
+// Estructura del grid en el markdown de teleticket.com.pe/conciertos:
+//
+//   [![](https://cdn.teleticket.com.pe/images/eventos/EVENT_calugalistado.jpg)\\
+//   \\
+//   ![ticket](...)\\
+//   \\
+//   **VENUE - DISTRICT - CITY** / Música\\
+//   \\
+//   \\
+//   **EVENT NAME**\\
+//   \\
+//   DATE_STRING](https://teleticket.com.pe/event-slug)
+//
+// Cada evento del grid empieza con `[![](https://cdn.teleticket` y las líneas
+// están separadas por `\\` + newline (hard line breaks de markdown).
+// Los eventos NO musicales (Teatro/Entretenimiento/etc.) se filtran aquí
+// para no gastar créditos en sus páginas de detalle.
 
-/** Decodes common HTML entities to plain text. */
-function decodeHtml(str: string): string {
-  return str
-    .replace(/&amp;/g,  "&")
-    .replace(/&lt;/g,   "<")
-    .replace(/&gt;/g,   ">")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
-    .replace(/&nbsp;/g, " ")
-    .trim();
+function normalizeMarkdownBreaks(md: string): string {
+  return md
+    .replace(/\\\\\n/g, " ")  // \\ + newline → espacio
+    .replace(/\\\s+/g, " ")   // \ residual + whitespace → espacio
+    .replace(/\s{2,}/g, " "); // multi-espacio → uno
 }
 
-function normalizeScrapedPrice(value: number | null): number | null {
-  if (value == null) return null;
-  return value >= MIN_VALID_PRICE_PEN ? value : null;
-}
+function parseListingMarkdown(markdown: string): ListingEvent[] {
+  // El grid empieza después del carrusel de banners, marcado por ‹›
+  const gridStart = markdown.indexOf("‹›");
+  const gridMd    = gridStart !== -1 ? markdown.slice(gridStart) : markdown;
+  const clean     = normalizeMarkdownBreaks(gridMd);
 
-function normalizeTeleticketEventUrl(rawHref: string | null | undefined): string | null {
-  if (!rawHref) return null;
+  // Dividir por inicio de cada tarjeta de evento (imagen calugalistado = grid item)
+  const chunks = clean.split(/(?=\[!\[\]\(https:\/\/cdn\.teleticket[^)]*calugalistado)/);
 
-  const href = decodeHtml(rawHref.trim());
-  const blockedPaths = new Set([
-    "/",
-    "/conciertos",
-    "/deportes",
-    "/teatro",
-    "/entretenimiento",
-    "/otros",
-    "/todos",
-    "/puntosventa",
-  ]);
+  const events: ListingEvent[] = [];
+  const seen   = new Set<string>();
 
-  try {
-    const url = href.startsWith("http")
-      ? new URL(href)
-      : new URL(href, "https://teleticket.com.pe");
+  for (const chunk of chunks) {
+    if (!chunk.includes("calugalistado")) continue;
 
-    if (url.hostname !== "teleticket.com.pe") return null;
+    // cover_url
+    const coverM = chunk.match(/\[!\[\]\((https:\/\/cdn\.teleticket[^)]+)\)/);
 
-    const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
-    const normalizedPathLower = normalizedPath.toLowerCase();
+    // venue_raw + category: **VENUE** / Música
+    const venueM = chunk.match(
+      /\*\*([^*]+)\*\*\s*\/\s*(Música|Teatro|Entretenimiento|Deportes|Otros)/,
+    );
 
-    if (blockedPaths.has(normalizedPathLower)) return null;
-    if (normalizedPathLower.startsWith("/account/")) return null;
-    if (normalizedPathLower.startsWith("/cliente/")) return null;
-    if (normalizedPathLower.startsWith("/landing/")) return null;
+    // name: último **...** antes del cierre ](URL)
+    const boldMatches = [...chunk.matchAll(/\*\*([^*]+)\*\*/g)];
+    const nameM = boldMatches.length >= 2 ? boldMatches[boldMatches.length - 1] : null;
 
-    url.pathname = normalizedPath;
-    url.search = "";
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return null;
-  }
-}
+    // ticket_url: cierre ](https://teleticket.com.pe/slug)
+    const urlM = chunk.match(/\]\((https:\/\/teleticket\.com\.pe\/([^)]+))\)\s*$/);
 
-function parseTeleticketDate(chunk: string): ParsedEventDate | null {
-  const getDateMatch = chunk.match(/v-html="getDate\(\[\s*'(\d{4}-\d{2}-\d{2})'/i);
-  const isoDate = getDateMatch?.[1] ?? null;
+    if (!venueM || !nameM || !urlM) continue;
 
-  if (!isoDate) return null;
+    // date_raw: texto entre el final del último **name** y el ](URL)
+    const afterName  = chunk.slice((nameM.index ?? 0) + nameM[0].length);
+    const dateM      = afterName.match(/^\s*([\d][^[]*?)(?:\s*\]\(https:\/\/teleticket)/);
+    const date_raw   = dateM?.[1]?.trim() ?? "";
 
-  return {
-    isoDate,
-    startsAt: `${isoDate}T00:00:00-05:00`,
-  };
-}
+    const ticket_url = urlM[1];
+    if (seen.has(ticket_url)) continue; // el carrusel repite algunos eventos
+    seen.add(ticket_url);
 
-function getListingDiagnostics(html: string): ListingDiagnostics {
-  const totalArticles = Math.max(0, html.split("<article").length - 1);
-  const pageMatches = [...html.matchAll(/class="page-link"[^>]*data-page="(\d+)"/g)];
-  const paginatorPages = pageMatches.length
-    ? Math.max(...pageMatches.map((match) => parseInt(match[1], 10)))
-    : 1;
-
-  return { totalArticles, paginatorPages };
-}
-
-/**
- * Parses the Teleticket listing HTML and returns an array of RawEvents.
- *
- * HTML structure (as of 2026-03):
- *   <article class="filtr-item event-item col-6" id="event_N">
- *     <a href="/event-slug">
- *       <div class="aspect__inner">
- *         <img src="https://cdn.teleticket.com.pe/..." class="img--evento">
- *       </div>
- *       <div class="evento--box">
- *         <p class="descripcion text-truncate">
- *           <strong>VENUE NAME - CITY</strong> / Música
- *         </p>
- *         <h3 title="EVENT NAME">EVENT NAME</h3>
- *         <p class="fecha" v-html="getDate(['2026-05-24', '', ''])">...</p>
- *       </div>
- *     </a>
- *   </article>
- *
- * Returns [] if the HTML lacks the expected structure.
- */
-function parseEvents(html: string): RawEvent[] {
-  const events: RawEvent[] = [];
-  const parts = html.split('<article');
-  for (let i = 1; i < parts.length; i++) {
-    const chunk = '<article' + parts[i];
-    const hrefMatch  = chunk.match(/href="([^"]+)"/);
-    const nameMatch  = chunk.match(/<h3[^>]*title="([^"]+)"/) ?? chunk.match(/<h3[^>]*>([\s\S]*?)<\/h3>/);
-    const imgMatch   = chunk.match(/class="[^"]*aspect__inner[^"]*"[^>]*>[\s\S]*?<img[^>]*src="([^"]+)"/);
-    const venueMatch = chunk.match(/<strong[^>]*>([\s\S]*?)<\/strong>/);
-    const ticketUrl  = normalizeTeleticketEventUrl(hrefMatch?.[1]);
-    const parsedDate = parseTeleticketDate(chunk);
-    const name = nameMatch?.[1] ? decodeHtml(nameMatch[1].trim()) : null;
-
-    if (!name || !ticketUrl || !parsedDate) continue;
+    if (!date_raw) continue; // sin fecha no sirve
 
     events.push({
-      name,
-      ticket_url:  ticketUrl,
-      cover_url:   imgMatch?.[1]   ?? null,
-      venue:       venueMatch?.[1] ? decodeHtml(venueMatch[1].trim()) : null,
-      date:        parsedDate.startsAt,
-      start_time:  null,
-      price_min:   null,
+      name:       nameM[1].trim(),
+      venue_raw:  venueM[1].trim(),
+      category:   venueM[2],
+      date_raw,
+      cover_url:  coverM?.[1] ?? null,
+      ticket_url,
+      slug:       urlM[2],
     });
   }
+
   return events;
 }
 
-// ─── Event detail scraper ─────────────────────────────────────────────────────
+// ─── Date parser ──────────────────────────────────────────────────────────────
 //
-// Fetches a single event page and extracts start_time + price_min.
-// Never throws — returns nulls on any failure.
-//
-// Time patterns handled:
-//   "19:00"  "8:00 pm"  "8:00PM"  "20:30 hrs"  "20:30 h"
-//
-// Price patterns handled (Soles):
-//   "S/ 120"  "S/120.00"  "S/ 80.50"  "desde S/ 80"
-//   Multiple prices → lowest value is stored as price_min.
+// Formatos observados en el listing:
+//   "24 de mayo 2026"
+//   "27 de marzo 2026 - 28 de marzo 2026"   → tomar primera fecha
+//   "19 de marzo 2026 al 05 de abril 2026"  → tomar primera fecha
+//   "30 de mayo 2026 al 31 de mayo 2026"    → tomar primera fecha
 
-async function fetchEventDetail(ticketUrl: string): Promise<EventDetail> {
-  let html: string;
+const MONTH_MAP: Record<string, number> = {
+  enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
+  julio: 7, agosto: 8, setiembre: 9, septiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+};
+
+function parseSpanishDate(raw: string): string | null {
+  // Tomar solo la primera fecha en rangos ("27 de marzo 2026 - 28 de marzo 2026")
+  const first = raw.split(/\s+-\s+|\s+al\s+/)[0].trim();
+
+  const m = first
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .match(/(\d{1,2})\s+de\s+([a-z]+)\s+(\d{4})/);
+
+  if (!m) return null;
+
+  const day   = parseInt(m[1], 10);
+  const month = MONTH_MAP[m[2]];
+  const year  = parseInt(m[3], 10);
+
+  if (!month || day < 1 || day > 31) return null;
+
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00-05:00`;
+}
+
+// ─── Detail page parser ───────────────────────────────────────────────────────
+//
+// Solo se llama para eventos sin precio o sin hora — para ahorrar créditos.
+//
+// Campos extraídos del markdown de la página de detalle:
+//
+//   Precio:   tabla markdown con celdas "S/160.00", "S/188.00", etc.
+//             → extractMinPriceFromMarkdown() toma el mínimo.
+//
+//   Hora:     "**Hora de inicio:** El evento podrá comenzar a las 09:00 p.m."
+//             → regex determinista, nunca inferido.
+//
+//   Recinto:  "**Recinto:** Costa 21 - Costa Verde S/N - San Miguel, Lima Perú."
+//             → venue más preciso que el del listing (tiene dirección completa).
+
+async function fetchDetailData(ticketUrl: string): Promise<DetailData> {
   try {
-    const res = await fetch(ticketUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; grub-scraper/1.0; +https://grub.app)" },
-    });
-    if (!res.ok) return { start_time: null, price_min: null };
-    html = await res.text();
-  } catch {
-    return { start_time: null, price_min: null };
-  }
+    const { markdown } = await scrapeMarkdown(ticketUrl, { waitFor: 1500 }, 2);
 
-  // ── start_time ────────────────────────────────────────────────────────────
-  // Match HH:MM optionally followed by am/pm/hrs/h (case-insensitive).
-  let start_time: string | null = null;
-  const timeMatch = html.match(/\b(\d{1,2}):(\d{2})\s*(?:hrs?|am|pm)?/i);
-  if (timeMatch) {
-    let hours   = parseInt(timeMatch[1], 10);
-    const mins  = timeMatch[2];
-    // Detect am/pm suffix in the full match
-    const suffix = (timeMatch[0].match(/[ap]m/i) ?? [])[0]?.toLowerCase();
-    if (suffix === "pm" && hours < 12) hours += 12;
-    if (suffix === "am" && hours === 12) hours = 0;
-    start_time = `${String(hours).padStart(2, "0")}:${mins}:00`;
-  }
+    // ── Precio ────────────────────────────────────────────────────────────────
+    const price_min = extractMinPriceFromMarkdown(markdown);
 
-  // ── price_min ─────────────────────────────────────────────────────────────
-  // Collect all "S/ NNN" amounts; take the minimum.
-  let price_min: number | null = null;
-  const priceRe = /S\/\s*(\d+(?:\.\d{1,2})?)/gi;
-  let m: RegExpExecArray | null;
-  const prices: number[] = [];
-  while ((m = priceRe.exec(html)) !== null) {
-    prices.push(parseFloat(m[1]));
-  }
-  if (prices.length) price_min = Math.min(...prices);
-
-  return { start_time, price_min };
-}
-
-// ─── Genre inference ─────────────────────────────────────────────────────────
-
-/**
- * Infers Grub genre slugs from a scraped event name via keyword matching.
- * Teleticket has no classification API — name is the only signal available.
- */
-function inferGenresScraper(event: RawEvent): string[] {
-  const n = event.name.toLowerCase();
-  const slugs = new Set<string>();
-
-  const rules: [RegExp, string][] = [
-    [/techno/,                         "techno"],
-    [/house/,                          "house"],
-    [/reggaet/,                        "reggaeton"],
-    [/salsa/,                          "salsa"],
-    [/cumbia/,                         "cumbia"],
-    [/vallenato/,                      "vallenato"],
-    [/bachata/,                        "bachata"],
-    [/merengue/,                       "merengue"],
-    [/rock|metal/,                     "rock"],
-    [/hip[\s-]hop|rap\b/,             "hip-hop"],
-    [/trap/,                           "trap"],
-    [/r&b|r\s*&\s*b|rnb|r\'n\'b/,    "rnb"],
-    [/soul/,                           "rnb"],
-    [/\bindie\b/,                       "indie"],
-    [/electro|edm|rave/,               "electronica"],
-    [/latin[\s-]bass|bass\b/,         "latin-bass"],
-    [/jazz/,                           "jazz"],
-    [/blues/,                          "rock"],
-    [/folk/,                           "alternativo"],
-    [/flamenco/,                       "alternativo"],
-    [/k[\s-]?pop|kpop/,               "kpop"],
-    [/\bpop\b/,                        "pop"],
-  ];
-
-  for (const [re, slug] of rules) {
-    if (re.test(n)) slugs.add(slug);
-  }
-
-  // No fallback — si no hay keyword clara, dejar sin género para que enrich-artists lo resuelva
-
-  return [...slugs];
-}
-
-// ─── Genre linking ────────────────────────────────────────────────────────────
-
-/**
- * For each inferred slug, resolves the genre_id from `genres` and inserts
- * into `event_genres`. Unknown slugs are silently skipped.
- */
-async function linkGenres(eventId: string, slugs: string[]): Promise<void> {
-  for (const slug of slugs) {
-    const { data: genre } = await supabase
-      .from("genres")
-      .select("id")
-      .eq("slug", slug)
-      .maybeSingle();
-
-    if (!genre) {
-      console.warn(`[linkGenres] unknown slug "${slug}" — skipping`);
-      continue;
+    // ── Hora de inicio ────────────────────────────────────────────────────────
+    // Patrones: "09:00 p.m."  "8:00 pm"  "20:30 hrs"
+    let start_time: string | null = null;
+    const horaM = markdown.match(
+      /[Hh]ora\s+de\s+inicio[^0-9]*(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?/i,
+    );
+    if (horaM) {
+      let h    = parseInt(horaM[1], 10);
+      const mi = horaM[2];
+      const ap = horaM[3]?.replace(/\./g, "").toLowerCase();
+      if (ap === "pm" && h < 12) h += 12;
+      if (ap === "am" && h === 12) h = 0;
+      start_time = `${String(h).padStart(2, "0")}:${mi}:00`;
     }
 
-    const { error } = await supabase
-      .from("event_genres")
-      .insert({ event_id: eventId, genre_id: genre.id });
-
-    // Postgres unique-violation code: 23505 — treat as harmless (ON CONFLICT DO NOTHING)
-    if (error && error.code !== "23505") {
-      console.error(`[linkGenres] insert failed for slug "${slug}":`, error.message);
+    // ── Recinto ───────────────────────────────────────────────────────────────
+    // "**Recinto:** Costa 21 - Costa Verde S/N - San Miguel, Lima Perú."
+    let venue_raw: string | null = null;
+    const recintoM = markdown.match(/[Rr]ecinto[^:]*:\*+\s*([^\n.]+)/);
+    if (recintoM) {
+      venue_raw = recintoM[1].trim().replace(/\*+/g, "").trim() || null;
     }
+
+    return { start_time, price_min, venue_raw };
+  } catch (err) {
+    console.warn(`[sync-teleticket] detail fetch failed for ${ticketUrl}:`, err);
+    return { start_time: null, price_min: null, venue_raw: null };
   }
 }
 
-// ─── Non-musical event filter ────────────────────────────────────────────────
+// ─── Upsert ───────────────────────────────────────────────────────────────────
 
-/**
- * Positive signals: if any of these appear in name or venue the event is
- * treated as musical unconditionally, overriding any NON_MUSIC_KEYWORDS hit.
- */
-const MUSIC_SIGNALS = [
-  "concierto", "concert",
-  "tour", "world tour",
-  " live", "live show", "en vivo",
-  "dj set", "dj session",
-  "festival",
-  "banda", "band",
-  "tributo", "tribute",
-  "techno", "house", "reggaeton", "salsa", "cumbia",
-  "hip-hop", "hip hop", "rap",
-  "indie", "rock", "metal",
-  "edm", "rave", "electronica",
-  "reggae", "cumbia", "merengue",
-];
+type UpsertOutcome = "inserted" | "updated" | "failed" | "skipped";
 
-const NON_MUSIC_KEYWORDS = [
-  "estacionamiento",
-  // Teatro
-  "el musical", "teatro", "arlequin", "obra de", "obra", "comedia",
-  // Humor
-  "humor", "imitaciones", "stand up", "standup", "stand-up", "comico", "monólogo", "monologo",
-  // Ballet / danza
-  "ballet", "danza", "cisnes", "lago de los",
-  // Clásica institucional
-  "temporada de abono", "ciclo cuerdas", "sinfonia alla",
-  "sinfonía alla", "temporada sinfonica", "temporada",
-  "clásicos de", "clasicos de",
-  // Infantil / familia
-  "fiesta en la granja", "show infantil", "espectáculo infantil", "espectaculo infantil",
-  // Variedades
-  "magia", "circo",
-];
-
-/**
- * Returns false if the event is clearly non-musical based on keyword matching.
- *
- * Logic:
- *  1. If name or venue contains any MUSIC_SIGNAL → musical (no further checks).
- *  2. If name or venue contains any NON_MUSIC_KEYWORD → not musical.
- *  3. Otherwise → musical (default open).
- *
- * Non-musical events are still upserted but with is_active = false for manual review.
- */
-function isMusicalEvent(name: string, venue: string): boolean {
-  const haystack = `${name} ${venue}`.toLowerCase();
-
-  if (MUSIC_SIGNALS.some(kw => haystack.includes(kw))) return true;
-  if (NON_MUSIC_KEYWORDS.some(kw => haystack.includes(kw))) return false;
-
-  return true;
-}
-
-// ─── Supabase upsert ─────────────────────────────────────────────────────────
-
-async function upsertEvent(event: RawEvent): Promise<UpsertOutcome> {
-  if (!isMusicalEvent(event.name, event.venue ?? "")) {
-    console.warn(`[sync-teleticket] skipping non-musical event: ${event.name}`);
-    return "failed";
-  }
-
-  const resolvedLocation = resolveEventLocation({
-    rawVenue: event.venue,
-    rawName: event.name,
+async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
+  const resolvedLoc = resolveEventLocation({
+    rawVenue: event.venue ?? null,
+    rawName:  event.name,
   });
-  const venue_id = resolvedLocation.venue
+
+  const venue_id = resolvedLoc.venue
     ? await upsertVenue(supabase, {
-        name: resolvedLocation.venue,
-        city: resolvedLocation.city,
-        country_code: resolvedLocation.country_code,
+        name:         resolvedLoc.venue,
+        city:         resolvedLoc.city,
+        country_code: resolvedLoc.country_code,
       })
     : null;
 
-  const row: EventRow = {
-    name:        stripTrailingCityFromEventName(event.name, resolvedLocation.city),
-    date:        event.date,
-    venue:       resolvedLocation.venue,
+  const row = toEventRow(
+    {
+      ...event,
+      name:         stripTrailingCityFromEventName(event.name, resolvedLoc.city),
+      venue:        resolvedLoc.venue,
+      city:         resolvedLoc.city,
+      country_code: resolvedLoc.country_code,
+    },
     venue_id,
-    city:        resolvedLocation.city,
-    country_code: resolvedLocation.country_code,
-    ticket_url:  event.ticket_url,
-    cover_url:   event.cover_url,
-    price_min:   normalizeScrapedPrice(event.price_min),
-    price_max:   null,
-    start_time:  event.start_time,
-    lineup:      [],
-    description: null,
-    is_active:   isMusicalEvent(event.name, event.venue ?? ""),
-    source:      SOURCE,
-  };
+  );
 
   try {
-    // Check existence first so we can distinguish insert vs update.
-    const { data: existing, error: selectError } = await supabase
+    // Buscar por ticket_url (clave de dedup para teleticket)
+    const { data: existing, error: selErr } = await supabase
       .from("events")
       .select("id, price_min, start_time, venue_id")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
-    if (selectError) {
-      throw new Error(`SELECT failed for ${row.ticket_url}: ${selectError.message}`);
-    }
+    if (selErr) throw new Error(`SELECT: ${selErr.message}`);
 
     const isUpdate = existing !== null;
 
-    const writeRow: EventRow = existing
+    const writeRow = isUpdate
       ? {
           ...row,
+          // No sobreescribir campos que ya tienen valor
           price_min:  row.price_min  ?? existing.price_min,
           start_time: row.start_time ?? existing.start_time,
           venue_id:   row.venue_id   ?? existing.venue_id,
         }
       : row;
 
-    const { data: upserted, error: upsertError } = await supabase
+    const { data: upserted, error: upsertErr } = await supabase
       .from("events")
       .upsert(writeRow, { onConflict: "ticket_url" })
       .select("id")
       .single();
 
-    if (upsertError || !upserted) {
-      throw new Error(`UPSERT failed for ${row.ticket_url}: ${upsertError?.message}`);
-    }
+    if (upsertErr || !upserted) throw new Error(`UPSERT: ${upsertErr?.message}`);
 
-    // Link genres (non-fatal: errors are logged inside linkGenres)
-    const slugs = inferGenresScraper(event);
-    if (slugs.length) {
-      await linkGenres(upserted.id, slugs);
-    }
+    await linkGenres(supabase, upserted.id, event.genre_slugs);
 
     return isUpdate ? "updated" : "inserted";
   } catch (err) {
-    console.error(`[sync-teleticket] upsertEvent error for ${event.ticket_url}:`, err);
+    console.error(`[sync-teleticket] upsertEvent error ${event.ticket_url}:`, err);
     return "failed";
   }
 }
 
-// ─── Page processor ───────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
-/** Scrapes one Teleticket listing page and upserts all events found. */
-async function processPage(
-  url: string,
-  result: SyncResult,
-): Promise<void> {
-  const { html } = await fetchTeleticketPage(url);
-
-  if (!html) {
-    console.warn(`[sync-teleticket] empty response, skipping page: ${url}`);
-    return;
-  }
-
-  const diagnostics = getListingDiagnostics(html);
-  const events = parseEvents(html);
-
-  console.log(
-    `[sync-teleticket] ${url} → ${events.length} eventos parseados`,
-    `(articles=${diagnostics.totalArticles}, paginatorPages=${diagnostics.paginatorPages})`,
-  );
-
-  // Enrich up to DETAIL_BATCH_LIMIT events with hour + price from their detail page.
-  // Remaining events are upserted with nulls for those fields.
-  const toEnrich = events.slice(0, DETAIL_BATCH_LIMIT);
-  const rest     = events.slice(DETAIL_BATCH_LIMIT);
-
-  for (const event of toEnrich) {
-    const detail = await fetchEventDetail(event.ticket_url);
-    event.start_time = detail.start_time;
-    event.price_min  = detail.price_min;
-    await sleep(DETAIL_THROTTLE_MS);
-
-    const outcome = await upsertEvent(event);
-    result[outcome] += 1;
-  }
-
-  for (const event of rest) {
-    const outcome = await upsertEvent(event);
-    result[outcome] += 1;
-  }
-}
-
-// ─── Main loop ────────────────────────────────────────────────────────────────
-
-async function run(): Promise<SyncResult> {
-  const result: SyncResult = { inserted: 0, updated: 0, failed: 0 };
+async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
+  const result = emptySyncResult();
 
   console.log(`[sync-teleticket] version=${SCRAPER_VERSION}`);
 
-  await processPage(TELETICKET_BASE_URL, result);
+  // ── 1. Scrape listing (1 crédito) ─────────────────────────────────────────
+  const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 2500 });
+  const listings     = parseListingMarkdown(markdown);
+
+  // Ventana de fechas:
+  //   MIN_DATE  → enero 2026: histórico para que usuarios marquen eventos asistidos
+  //   todayLima → solo eventos futuros reciben página de detalle (precio + hora)
+  //               los pasados no necesitan ese dato — ahorra créditos
+  const MIN_DATE  = new Date("2026-01-01T00:00:00-05:00");
+  const todayLima = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "America/Lima" }),
+  );
+  todayLima.setHours(0, 0, 0, 0);
+
+  const musicListings = listings.filter((e) => {
+    if (e.category !== "Música") return false;
+    if (!isMusicalEvent(e.name, e.venue_raw ?? "")) return false;
+    const date = parseSpanishDate(e.date_raw);
+    if (!date) return false;
+    return new Date(date) >= MIN_DATE;
+  });
+
+  // Subdivisión: futuros (candidatos a detalle) vs. pasados (listing only)
+  const futureListings = musicListings.filter((e) =>
+    new Date(parseSpanishDate(e.date_raw)!) >= todayLima,
+  );
+  const pastListings = musicListings.filter((e) =>
+    new Date(parseSpanishDate(e.date_raw)!) < todayLima,
+  );
 
   console.log(
-    `Sync completo — inserted: ${result.inserted}, updated: ${result.updated}, failed: ${result.failed}`,
+    `[sync-teleticket] listing: ${listings.length} total →`,
+    `${futureListings.length} futuros, ${pastListings.length} pasados (desde ene-2026),`,
+    `${listings.length - musicListings.length} descartados`,
+  );
+
+  // ── 2. Enriquecer con páginas de detalle (1 crédito c/u) ──────────────────
+  // Solo eventos FUTUROS reciben detalle (precio + hora).
+  // Eventos pasados no lo necesitan — el usuario solo quiere marcar "fui a este".
+  const toEnrich = futureListings.slice(0, detailLimit);
+
+  const detailMap = new Map<string, DetailData>();
+
+  for (const listing of toEnrich) {
+    const detail = await fetchDetailData(listing.ticket_url);
+    detailMap.set(listing.ticket_url, detail);
+    await sleep(DETAIL_THROTTLE_MS);
+  }
+
+  // ── 3. Construir UnifiedEvent y upsertear ─────────────────────────────────
+  for (const listing of musicListings) {
+    const date = parseSpanishDate(listing.date_raw)!;
+
+    const detail   = detailMap.get(listing.ticket_url);
+    // Preferir venue del Recinto (más preciso) si está disponible
+    const venueRaw = detail?.venue_raw ?? listing.venue_raw;
+
+    const event: UnifiedEvent = {
+      source:          SOURCE,
+      ticket_url:      listing.ticket_url,
+      external_slug:   listing.slug,
+      name:            listing.name,
+      date,
+      start_time:      detail?.start_time ?? null,
+      venue:           venueRaw,
+      city:            "Lima",           // resolveEventLocation lo corregirá si es otra ciudad
+      country_code:    "PE",
+      cover_url:       listing.cover_url,
+      price_min:       detail?.price_min ?? null,
+      price_max:       null,
+      lineup:          [],
+      description:     null,
+      genre_slugs:     inferGenres(listing.name, listing.venue_raw ?? ""),
+      is_active:       true,
+      scraper_version: SCRAPER_VERSION,
+    };
+
+    const outcome = await upsertEvent(event);
+
+    if (outcome === "skipped") result.skipped += 1;
+    else result[outcome] += 1;
+  }
+
+  console.log(
+    `[sync-teleticket] done — inserted: ${result.inserted},`,
+    `updated: ${result.updated}, failed: ${result.failed}, skipped: ${result.skipped}`,
+  );
+  console.log(
+    `[sync-teleticket] créditos usados: ~${1 + toEnrich.length}`,
+    `(1 listing + ${toEnrich.length} detail de futuros, ${pastListings.length} pasados sin detalle)`,
   );
 
   return result;
 }
 
-// ─── Handler ─────────────────────────────────────────────────────────────────
+// ─── Handler ──────────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request): Promise<Response> => {
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), {
-      status: 405,
-      headers: { "Content-Type": "application/json" },
+      status: 405, headers: { "Content-Type": "application/json" },
     });
   }
 
   try {
-    const result = await run();
+    const body        = await req.json().catch(() => ({}));
+    const detailLimit = typeof body.detailLimit === "number" ? body.detailLimit : DETAIL_BATCH_LIMIT;
+    const result      = await run(detailLimit);
     return new Response(JSON.stringify(result), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+      status: 200, headers: { "Content-Type": "application/json" },
     });
   } catch (err) {
     console.error("[sync-teleticket]", err);
     return new Response(JSON.stringify({ error: "Internal server error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
+      status: 500, headers: { "Content-Type": "application/json" },
     });
   }
 });
@@ -597,30 +426,24 @@ Deno.serve(async (req: Request): Promise<Response> => {
 //
 // supabase functions deploy sync-teleticket --no-verify-jwt
 //
-// VARIABLES DE ENTORNO: ninguna adicional, usa las mismas de Supabase
-// (SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY son inyectadas automáticamente)
+// SECRETS requeridos (Supabase Dashboard → Edge Functions → sync-teleticket):
+//   FIRECRAWL_API_KEY=fc-...
+//   (SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY se inyectan automáticamente)
 //
-// CRON — correr 30 minutos después que sync-ticketmaster (8:30am UTC):
-// SELECT cron.schedule(
-//   'sync-teleticket-daily',
-//   '30 8 * * *',
-//   $$
-//   SELECT net.http_post(
-//     url     := current_setting('app.supabase_url') || '/functions/v1/sync-teleticket',
-//     headers := jsonb_build_object(
-//       'Authorization', 'Bearer ' || current_setting('app.service_role_key'),
-//       'Content-Type',  'application/json'
-//     ),
-//     body    := '{}'::jsonb
-//   )
-//   $$
-// );
+// CRON (8:30am UTC = 3:30am Lima):
+//   SELECT cron.schedule(
+//     'sync-teleticket-daily',
+//     '30 8 * * *',
+//     $$ SELECT net.http_post(
+//       url     := current_setting('app.supabase_url') || '/functions/v1/sync-teleticket',
+//       headers := jsonb_build_object(
+//         'Authorization', 'Bearer ' || current_setting('app.service_role_key'),
+//         'Content-Type',  'application/json'
+//       ),
+//       body := '{}'::jsonb
+//     ) $$
+//   );
 //
-// CURL DE PRUEBA:
-// curl -X POST https://TU_PROJECT_REF.supabase.co/functions/v1/sync-teleticket \
-//   -H "Authorization: Bearer TU_ANON_KEY" \
-//   -H "Content-Type: application/json"
-//
-// NOTA: Si el parsing falla porque Teleticket cambió su HTML,
-// revisar los selectores en parseEvents() con las DevTools del browser
-// (inspeccionar elemento en teleticket.com.pe/conciertos)
+// CRÉDITOS Firecrawl por run:
+//   ~1 (listing) + hasta 40 (detail pages) = máx 41 créditos/run
+//   En runs subsecuentes los eventos ya en DB se actualizan con ~5-10 nuevos/día

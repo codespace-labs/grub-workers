@@ -1,13 +1,11 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
 import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
-import { isMusicalEvent }               from "../_shared/music-filter.ts";
 import {
   emptySyncResult,
   toEventRow,
-  parseTicketmasterPeDateTime,
+  parseShortDate,
   validatePrice,
-  extractMinPriceFromMarkdown,
   type UnifiedEvent,
   type SyncResult,
 } from "../_shared/normalizer.ts";
@@ -22,39 +20,34 @@ import {
 const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")              ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-const LISTING_URL     = "https://www.ticketmaster.pe/page/categoria-conciertos";
-const SOURCE          = "ticketmaster" as const;
+const LISTING_URL     = "https://www.vastiontickets.com/";
+const SOURCE          = "vastion" as const;
 const SCRAPER_VERSION = "2026-03-19.1";
-
-// Detalle solo para precio (fecha y hora ya vienen del listing)
-const DETAIL_BATCH_LIMIT = 0;
-const DETAIL_THROTTLE_MS = 800;
-const MIN_DATE           = new Date("2026-01-01T00:00:00-05:00");
+const MIN_DATE        = new Date("2026-01-01T00:00:00-05:00");
 
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ListingEvent {
   name:       string;
   venue_raw:  string | null;
-  date_raw:   string;           // "Miercoles 20 de Mayo - 8:30 pm"
+  date_raw:   string;      // "04 ABR"
   cover_url:  string | null;
   ticket_url: string;
   slug:       string;
+  price_min:  number | null;
+  event_type: string;      // "Evento" | "Festival"
 }
 
 // ─── Listing parser ───────────────────────────────────────────────────────────
 //
-// Estructura del markdown (post-normalización de \\+newline):
+// Estructura del markdown de vastiontickets.com (post-normalización):
 //
-//   [![NAME](https://cdn.getcrowder.com/...)
-//   NAME
-//   **VENUE** DAY DD de MES - HH:MMpm](https://www.ticketmaster.pe/event/SLUG)
+//   [![NAME](IMAGE_URL) Evento/Festival **NAME** DD ABR • VENUE Desde S/ PRICE](URL)
 //
-// Nombre viene como alt text de la imagen y repetido como texto.
-// Venue en **bold**. Fecha y hora en la misma línea post-venue.
+// Todos los eventos de Vastion son de música electrónica / festivales.
+// Listing ya incluye venue y precio → NO se necesitan páginas de detalle.
 
 function normalizeBreaks(md: string): string {
   return md
@@ -65,55 +58,60 @@ function normalizeBreaks(md: string): string {
 
 function parseListingMarkdown(markdown: string): ListingEvent[] {
   const clean  = normalizeBreaks(markdown);
+  // Cada evento empieza con [![
   const chunks = clean.split(/(?=\[!\[)/);
   const events: ListingEvent[] = [];
   const seen   = new Set<string>();
 
   for (const chunk of chunks) {
-    if (!chunk.includes("getcrowder.com")) continue;
+    // Solo tarjetas de evento de Vastion (imagen de evento)
+    if (!chunk.includes("vastiontickets.com/evento/") && !chunk.includes("duapass.com/images/eventos/")) continue;
 
-    // cover + name (alt text)
-    const imgM = chunk.match(/\[!\[([^\]]*)\]\((https:\/\/cdn\.getcrowder\.com\/[^)]+)\)/);
+    // cover + name alt
+    const imgM = chunk.match(/\[!\[([^\]]*)\]\((https?:\/\/[^)]+)\)/);
     if (!imgM) continue;
 
     // ticket_url + slug
-    const urlM = chunk.match(/\]\((https:\/\/www\.ticketmaster\.pe\/event\/([^)]+))\)\s*$/);
+    const urlM = chunk.match(/\]\((https:\/\/www\.vastiontickets\.com\/evento\/([^)]+))\)\s*$/);
     if (!urlM) continue;
 
     const ticket_url = urlM[1];
     if (seen.has(ticket_url)) continue;
     seen.add(ticket_url);
 
-    // venue (bold) + date+time (resto de la línea)
-    const venueM    = chunk.match(/\*\*([^*]+)\*\*\s+(.+?)(?:\]\(https:\/\/www\.ticketmaster)/);
-    const name      = imgM[1].trim();
-    const venue_raw = venueM?.[1]?.trim() ?? null;
-    const date_raw  = venueM?.[2]?.trim() ?? "";
+    // tipo: "Evento" o "Festival"
+    const typeM = chunk.match(/\b(Evento|Festival)\b/);
 
-    if (!name || !date_raw) continue;
+    // nombre en bold (más confiable que alt text)
+    const boldM = chunk.match(/\*\*([^*]+)\*\*/);
+    const name  = boldM?.[1]?.trim() ?? imgM[1].trim();
+    if (!name) continue;
+
+    // fecha: "04 ABR", "18 ABR", "02 MAY"
+    const dateM = chunk.match(/\b(\d{1,2}\s+[A-Z]{3})\b/);
+    if (!dateM) continue;
+
+    // venue: texto entre "•" y "Desde"
+    const venueM = chunk.match(/•\s+([^D]+?)\s+Desde/);
+    const venue  = venueM?.[1]?.trim() ?? null;
+
+    // precio: "Desde S/ 70"
+    const priceM = chunk.match(/[Dd]esde\s+S\/\s*(\d+(?:[.,]\d{1,2})?)/);
+    const price  = priceM ? parseFloat(priceM[1].replace(",", ".")) : null;
 
     events.push({
       name,
-      venue_raw,
-      date_raw,
+      venue_raw:  venue,
+      date_raw:   dateM[1],
       cover_url:  imgM[2],
       ticket_url,
       slug:       urlM[2],
+      price_min:  price,
+      event_type: typeM?.[1] ?? "Evento",
     });
   }
 
   return events;
-}
-
-// ─── Detail page ──────────────────────────────────────────────────────────────
-
-async function fetchPriceFromDetail(ticketUrl: string): Promise<number | null> {
-  try {
-    const { markdown } = await scrapeMarkdown(ticketUrl, { waitFor: 1500 }, 2);
-    return extractMinPriceFromMarkdown(markdown);
-  } catch {
-    return null;
-  }
 }
 
 // ─── Upsert ───────────────────────────────────────────────────────────────────
@@ -135,7 +133,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
   try {
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, start_time, venue_id")
+      .select("id, price_min, venue_id")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -143,7 +141,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
     const isUpdate = existing !== null;
     const writeRow = isUpdate
-      ? { ...row, price_min: row.price_min ?? existing.price_min, start_time: row.start_time ?? existing.start_time, venue_id: row.venue_id ?? existing.venue_id }
+      ? { ...row, price_min: row.price_min ?? existing.price_min, venue_id: row.venue_id ?? existing.venue_id }
       : row;
 
     const { data: upserted, error: upsertErr } = await supabase
@@ -157,50 +155,30 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
     await linkGenres(supabase, upserted.id, event.genre_slugs);
     return isUpdate ? "updated" : "inserted";
   } catch (err) {
-    console.error(`[sync-ticketmaster-pe] upsert error ${event.ticket_url}:`, err);
+    console.error(`[sync-vastion] upsert error ${event.ticket_url}:`, err);
     return "failed";
   }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
+async function run(): Promise<SyncResult> {
   const result = emptySyncResult();
-  console.log(`[sync-ticketmaster-pe] version=${SCRAPER_VERSION}`);
+  console.log(`[sync-vastion] version=${SCRAPER_VERSION}`);
 
-  const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 2000 });
+  // Vastion tiene login modal → waitFor alto para asegurar que cargue el listing
+  const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 2500 });
   const listings     = parseListingMarkdown(markdown);
 
-  const todayLima = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Lima" }));
-  todayLima.setHours(0, 0, 0, 0);
+  console.log(`[sync-vastion] ${listings.length} eventos parseados`);
 
-  // Filtrar: música, desde MIN_DATE
-  const valid = listings.filter((e) => {
-    if (!isMusicalEvent(e.name, e.venue_raw ?? "")) return false;
-    const { date } = parseTicketmasterPeDateTime(e.date_raw);
-    if (!date) return false;
-    return new Date(date) >= MIN_DATE;
-  });
+  for (const listing of listings) {
+    const date = parseShortDate(listing.date_raw);
 
-  const futureListings = valid.filter((e) => {
-    const { date } = parseTicketmasterPeDateTime(e.date_raw);
-    return date ? new Date(date) >= todayLima : false;
-  });
-
-  console.log(`[sync-ticketmaster-pe] ${listings.length} total → ${valid.length} válidos (${futureListings.length} futuros)`);
-
-  // Detalle solo futuros (solo precio — fecha y hora ya están en listing)
-  const toEnrich = futureListings.slice(0, detailLimit);
-  const priceMap = new Map<string, number | null>();
-
-  for (const e of toEnrich) {
-    priceMap.set(e.ticket_url, await fetchPriceFromDetail(e.ticket_url));
-    await sleep(DETAIL_THROTTLE_MS);
-  }
-
-  for (const listing of valid) {
-    const { date, start_time } = parseTicketmasterPeDateTime(listing.date_raw);
-    if (!date) { result.skipped += 1; continue; }
+    if (!date || new Date(date) < MIN_DATE) {
+      result.skipped += 1;
+      continue;
+    }
 
     const event: UnifiedEvent = {
       source:          SOURCE,
@@ -208,15 +186,16 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
       external_slug:   listing.slug,
       name:            listing.name,
       date,
-      start_time,
+      start_time:      null,
       venue:           listing.venue_raw,
-      city:            "Lima",
+      city:            "Lima",         // Vastion opera en Lima
       country_code:    "PE",
       cover_url:       listing.cover_url,
-      price_min:       validatePrice(priceMap.get(listing.ticket_url) ?? null),
+      price_min:       validatePrice(listing.price_min),
       price_max:       null,
       lineup:          [],
       description:     null,
+      // Vastion = electrónica/festivales → inferGenres complementa con keywords del nombre
       genre_slugs:     inferGenres(listing.name, listing.venue_raw ?? ""),
       is_active:       true,
       scraper_version: SCRAPER_VERSION,
@@ -227,7 +206,8 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
     else result[outcome] += 1;
   }
 
-  console.log(`[sync-ticketmaster-pe] done — inserted:${result.inserted} updated:${result.updated} failed:${result.failed} skipped:${result.skipped}`);
+  console.log(`[sync-vastion] done — inserted:${result.inserted} updated:${result.updated} failed:${result.failed} skipped:${result.skipped}`);
+  console.log(`[sync-vastion] créditos usados: 1 (listing completo, precio+venue incluidos)`);
   return result;
 }
 
@@ -238,16 +218,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
   }
   try {
-    const body        = await req.json().catch(() => ({}));
-    const detailLimit = typeof body.detailLimit === "number" ? body.detailLimit : DETAIL_BATCH_LIMIT;
-    const result      = await run(detailLimit);
+    const result = await run();
     return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
   } catch (err) {
-    console.error("[sync-ticketmaster-pe]", err);
+    console.error("[sync-vastion]", err);
     return new Response(JSON.stringify({ error: "Internal server error" }), { status: 500, headers: { "Content-Type": "application/json" } });
   }
 });
 
-// DEPLOY: supabase functions deploy sync-ticketmaster-pe --no-verify-jwt
-// SECRETS: FIRECRAWL_API_KEY (SUPABASE_URL y SERVICE_ROLE_KEY son automáticas)
-// CRÉDITOS: 1 listing + hasta detailLimit detail pages por run
+// DEPLOY: supabase functions deploy sync-vastion --no-verify-jwt
+// SECRETS: FIRECRAWL_API_KEY
+// CRÉDITOS: 1 por run (listing completo incluye precio y venue)
+// NOTA: Vastion tiene pocos eventos (~3-5). Si en el futuro crecen,
+//       revisar si hay paginación en vastiontickets.com/eventos
