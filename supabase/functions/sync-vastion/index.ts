@@ -1,5 +1,5 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
+import { scrapeHtml }                   from "../_shared/firecrawl.ts";
 import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
 import {
   emptySyncResult,
@@ -14,16 +14,24 @@ import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
 } from "../_shared/location-normalization.ts";
+import {
+  buildSkippedNoChangeResult,
+  shouldSkipRecentNoChangeRun,
+} from "../_shared/sync-guard.ts";
+import { isExcludedEvent, EXCLUDED_SKIP_REASON } from "../_shared/event-filter.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")              ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-const LISTING_URL     = "https://www.vastiontickets.com/";
+const LISTING_URLS    = [
+  "https://www.vastiontickets.com/",
+];
 const SOURCE          = "vastion" as const;
 const SCRAPER_VERSION = "2026-03-19.1";
 const MIN_DATE        = new Date("2026-01-01T00:00:00-05:00");
+const NO_CHANGE_COOLDOWN_MINUTES = 30;
 
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -41,73 +49,73 @@ interface ListingEvent {
 }
 
 // ─── Listing parser ───────────────────────────────────────────────────────────
-//
-// Estructura del markdown de vastiontickets.com (post-normalización):
-//
-//   [![NAME](IMAGE_URL) Evento/Festival **NAME** DD ABR • VENUE Desde S/ PRICE](URL)
-//
-// Todos los eventos de Vastion son de música electrónica / festivales.
-// Listing ya incluye venue y precio → NO se necesitan páginas de detalle.
 
-function normalizeBreaks(md: string): string {
-  return md
-    .replace(/\\\\\n/g, " ")
-    .replace(/\\\s+/g, " ")
-    .replace(/\s{2,}/g, " ");
+function decodeHtml(value: string): string {
+  return value
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&#39;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">");
 }
 
-function parseListingMarkdown(markdown: string): ListingEvent[] {
-  const clean  = normalizeBreaks(markdown);
-  // Cada evento empieza con [![
-  const chunks = clean.split(/(?=\[!\[)/);
+function stripTags(value: string): string {
+  return decodeHtml(value).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function absolutizeTicketUrl(href: string): string | null {
+  if (href.startsWith("https://www.vastiontickets.com/evento/")) return href;
+  if (href.startsWith("/evento/")) return `https://www.vastiontickets.com${href}`;
+  return null;
+}
+
+function extractSlug(href: string): string | null {
+  const absolute = absolutizeTicketUrl(href);
+  if (!absolute) return null;
+  return absolute.split("/evento/")[1] ?? null;
+}
+
+function parseListingHtml(html: string): ListingEvent[] {
+  const chunks = html.split(/(?=<a[^>]+href="(?:https:\/\/www\.vastiontickets\.com)?\/evento\/)/i);
   const events: ListingEvent[] = [];
   const seen   = new Set<string>();
 
   for (const chunk of chunks) {
-    // Solo tarjetas de evento de Vastion (imagen de evento)
-    if (!chunk.includes("vastiontickets.com/evento/") && !chunk.includes("duapass.com/images/eventos/")) continue;
+    const hrefM = chunk.match(/href="((?:https:\/\/www\.vastiontickets\.com)?\/evento\/[^"]+)"/i);
+    if (!hrefM) continue;
 
-    // cover + name alt
-    const imgM = chunk.match(/\[!\[([^\]]*)\]\((https?:\/\/[^)]+)\)/);
-    if (!imgM) continue;
-
-    // ticket_url + slug
-    const urlM = chunk.match(/\]\((https:\/\/www\.vastiontickets\.com\/evento\/([^)]+))\)\s*$/);
-    if (!urlM) continue;
-
-    const ticket_url = urlM[1];
+    const ticket_url = absolutizeTicketUrl(hrefM[1]);
+    const slug = extractSlug(hrefM[1]);
+    if (!ticket_url || !slug) continue;
     if (seen.has(ticket_url)) continue;
     seen.add(ticket_url);
 
-    // tipo: "Evento" o "Festival"
-    const typeM = chunk.match(/\b(Evento|Festival)\b/);
-
-    // nombre en bold (más confiable que alt text)
-    const boldM = chunk.match(/\*\*([^*]+)\*\*/);
-    const name  = boldM?.[1]?.trim() ?? imgM[1].trim();
+    const nameM = chunk.match(/class="event-title"[^>]*>([\s\S]*?)<\/h3>/i);
+    const name = nameM ? stripTags(nameM[1]) : null;
     if (!name) continue;
 
-    // fecha: "04 ABR", "18 ABR", "02 MAY"
-    const dateM = chunk.match(/\b(\d{1,2}\s+[A-Z]{3})\b/);
+    const dateM = chunk.match(/class="event-date-col"[^>]*>([\s\S]*?)<\/span>/i);
     if (!dateM) continue;
+    const date_raw = stripTags(dateM[1]).toUpperCase();
 
-    // venue: texto entre "•" y "Desde"
-    const venueM = chunk.match(/•\s+([^D]+?)\s+Desde/);
-    const venue  = venueM?.[1]?.trim() ?? null;
+    const venueM = chunk.match(/class="event-loc-col"[^>]*>([\s\S]*?)<\/span>/i);
+    const venue = venueM ? stripTags(venueM[1]) : null;
 
-    // precio: "Desde S/ 70"
-    const priceM = chunk.match(/[Dd]esde\s+S\/\s*(\d+(?:[.,]\d{1,2})?)/);
+    const priceM = chunk.match(/class="event-price"[^>]*>[\s\S]*?S\/\s*(\d+(?:[.,]\d{1,2})?)/i);
     const price  = priceM ? parseFloat(priceM[1].replace(",", ".")) : null;
+
+    const imgM = chunk.match(/<img[^>]+src="([^"]+)"[^>]*>/i);
+    const badgeM = chunk.match(/class="event-badge"[^>]*>([\s\S]*?)<\/div>/i);
 
     events.push({
       name,
       venue_raw:  venue,
-      date_raw:   dateM[1],
-      cover_url:  imgM[2],
+      date_raw,
+      cover_url:  imgM?.[1] ?? null,
       ticket_url,
-      slug:       urlM[2],
+      slug,
       price_min:  price,
-      event_type: typeM?.[1] ?? "Evento",
+      event_type: badgeM ? stripTags(badgeM[1]) : "Evento",
     });
   }
 
@@ -133,7 +141,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
   try {
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, venue_id")
+      .select("id, price_min, venue_id, is_active")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -141,7 +149,12 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
     const isUpdate = existing !== null;
     const writeRow = isUpdate
-      ? { ...row, price_min: row.price_min ?? existing.price_min, venue_id: row.venue_id ?? existing.venue_id }
+      ? {
+          ...row,
+          price_min: row.price_min ?? existing.price_min,
+          venue_id: row.venue_id ?? existing.venue_id,
+          is_active: existing.is_active,
+        }
       : row;
 
     const { data: upserted, error: upsertErr } = await supabase
@@ -162,21 +175,80 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run(): Promise<SyncResult> {
+async function run(options: { forceRefresh?: boolean } = {}): Promise<SyncResult> {
+  const guard = await shouldSkipRecentNoChangeRun(supabase, {
+    source: SOURCE,
+    cooldownMinutes: NO_CHANGE_COOLDOWN_MINUTES,
+    forceRefresh: options.forceRefresh,
+  });
+  if (guard.skip) {
+    console.log(`[sync-vastion] skip sin cambios recientes (${guard.cooldownMinutes} min)`);
+    return buildSkippedNoChangeResult(SOURCE, guard);
+  }
+
   const result = emptySyncResult();
   console.log(`[sync-vastion] version=${SCRAPER_VERSION}`);
 
-  // Vastion tiene login modal → waitFor alto para asegurar que cargue el listing
-  const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 2500 });
-  const listings     = parseListingMarkdown(markdown);
+  const seenListings = new Set<string>();
+  const listings: ListingEvent[] = [];
 
-  console.log(`[sync-vastion] ${listings.length} eventos parseados`);
+  for (const url of LISTING_URLS) {
+    try {
+      const { html, statusCode } = await scrapeHtml(url, {
+        waitFor: 3500,
+        actions: [
+          { type: "scroll", direction: "down", amount: 1200 },
+          { type: "wait", milliseconds: 800 },
+          { type: "scroll", direction: "down", amount: 1200 },
+          { type: "wait", milliseconds: 800 },
+          { type: "scroll", direction: "down", amount: 1200 },
+          { type: "wait", milliseconds: 800 },
+        ],
+      });
+      if (statusCode >= 400) {
+        console.warn(`[sync-vastion] ${url}: HTTP ${statusCode}`);
+        continue;
+      }
+
+      const parsed = parseListingHtml(html);
+      console.log(`[sync-vastion] ${url}: ${parsed.length} eventos parseados`);
+
+      for (const listing of parsed) {
+        if (seenListings.has(listing.ticket_url)) continue;
+        seenListings.add(listing.ticket_url);
+        listings.push(listing);
+      }
+    } catch (error) {
+      console.error(`[sync-vastion] fallo leyendo ${url}:`, error);
+    }
+  }
+
+  console.log(`[sync-vastion] ${listings.length} eventos únicos tras merge de listings`);
+  result.diagnostics = {
+    discovered: listings.length,
+    parsed: listings.length,
+    detail_fetched: 0,
+    skipped_reasons: {},
+  };
+
+  const markSkipped = (reason: string) => {
+    result.skipped += 1;
+    const bucket = result.diagnostics?.skipped_reasons ?? {};
+    bucket[reason] = (bucket[reason] ?? 0) + 1;
+    if (result.diagnostics) result.diagnostics.skipped_reasons = bucket;
+  };
 
   for (const listing of listings) {
     const date = parseShortDate(listing.date_raw);
+    const genre_slugs = inferGenres(listing.name, listing.venue_raw ?? "");
 
     if (!date || new Date(date) < MIN_DATE) {
-      result.skipped += 1;
+      markSkipped(!date ? "invalid_date" : "before_min_date");
+      continue;
+    }
+
+    if (isExcludedEvent(listing.name, listing.venue_raw)) {
+      markSkipped(EXCLUDED_SKIP_REASON);
       continue;
     }
 
@@ -196,7 +268,7 @@ async function run(): Promise<SyncResult> {
       lineup:          [],
       description:     null,
       // Vastion = electrónica/festivales → inferGenres complementa con keywords del nombre
-      genre_slugs:     inferGenres(listing.name, listing.venue_raw ?? ""),
+      genre_slugs,
       is_active:       true,
       scraper_version: SCRAPER_VERSION,
     };
@@ -218,7 +290,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
   }
   try {
-    const result = await run();
+    const body = await req.json().catch(() => ({})) as { force_refresh?: boolean };
+    const result = await run({ forceRefresh: body.force_refresh === true });
     return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
   } catch (err) {
     console.error("[sync-vastion]", err);

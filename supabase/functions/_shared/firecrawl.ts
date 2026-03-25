@@ -35,6 +35,12 @@ export interface FirecrawlResult {
   statusCode: number;
 }
 
+export interface FirecrawlHtmlResult {
+  html:       string;
+  url:        string;
+  statusCode: number;
+}
+
 // ─── Helpers internos ─────────────────────────────────────────────────────────
 
 function redactKey(msg: string): string {
@@ -106,6 +112,84 @@ export async function scrapeMarkdown(
       return {
         markdown:   json.data.markdown,
         url:        json.data.metadata?.url ?? url,
+        statusCode: json.data.metadata?.statusCode ?? res.status,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const safeMsg = redactKey(lastError.message);
+
+      if (attempt < maxRetries) {
+        const wait = baseBackoffMs * 2 ** attempt;
+        console.warn(
+          `[firecrawl] intento ${attempt + 1}/${maxRetries + 1} fallido: ${safeMsg}` +
+          ` — reintentando en ${wait}ms`,
+        );
+        await sleep(wait);
+      } else {
+        console.error(
+          `[firecrawl] todos los reintentos agotados para ${url}: ${safeMsg}`,
+        );
+      }
+    }
+  }
+
+  throw new FirecrawlError(
+    redactKey(lastError?.message ?? "error desconocido"),
+    0,
+  );
+}
+
+export async function scrapeHtml(
+  url: string,
+  opts: FirecrawlScrapeOptions = {},
+  maxRetries = 3,
+  baseBackoffMs = 2000,
+): Promise<FirecrawlHtmlResult> {
+  const body: Record<string, unknown> = {
+    url,
+    formats: ["html"],
+  };
+
+  if (opts.waitFor) body.waitFor = opts.waitFor;
+  if (opts.actions?.length) body.actions = opts.actions;
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(`${FIRECRAWL_BASE}/scrape`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${FIRECRAWL_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (res.status === 429) {
+        const retryAfter = parseInt(res.headers.get("Retry-After") ?? "10", 10);
+        console.warn(`[firecrawl] rate-limited → esperando ${retryAfter}s`);
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      const json = await res.json() as {
+        success: boolean;
+        data?: {
+          html?: string;
+          metadata?: { statusCode?: number; url?: string };
+        };
+        error?: string;
+      };
+
+      if (!json.success || !json.data?.html) {
+        const msg = redactKey(json.error ?? `HTTP ${res.status} sin html`);
+        throw new FirecrawlError(msg, res.status);
+      }
+
+      return {
+        html: json.data.html,
+        url: json.data.metadata?.url ?? url,
         statusCode: json.data.metadata?.statusCode ?? res.status,
       };
     } catch (err) {

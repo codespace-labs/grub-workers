@@ -254,10 +254,28 @@ export interface SyncResult {
   updated:  number;
   failed:   number;
   skipped:  number;   // eventos no musicales o sin fecha
+  diagnostics?: {
+    discovered?: number;
+    parsed?: number;
+    detail_fetched?: number;
+    skipped_reasons?: Record<string, number>;
+    [key: string]: unknown;
+  };
 }
 
 export function emptySyncResult(): SyncResult {
-  return { inserted: 0, updated: 0, failed: 0, skipped: 0 };
+  return {
+    inserted: 0,
+    updated: 0,
+    failed: 0,
+    skipped: 0,
+    diagnostics: {
+      discovered: 0,
+      parsed: 0,
+      detail_fetched: 0,
+      skipped_reasons: {},
+    },
+  };
 }
 
 /**

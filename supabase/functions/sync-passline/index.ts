@@ -15,6 +15,11 @@ import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
 } from "../_shared/location-normalization.ts";
+import {
+  buildSkippedNoChangeResult,
+  shouldSkipRecentNoChangeRun,
+} from "../_shared/sync-guard.ts";
+import { isExcludedEvent, EXCLUDED_SKIP_REASON } from "../_shared/event-filter.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -22,10 +27,12 @@ const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")              ?? "
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
 const SOURCE             = "passline" as const;
-const SCRAPER_VERSION    = "2026-03-19.1";
+const SCRAPER_VERSION    = "2026-03-19.2";
 const MIN_DATE           = new Date("2026-01-01T00:00:00-05:00");
-const DETAIL_BATCH_LIMIT = 5;
-const DETAIL_THROTTLE_MS = 800;
+const DETAIL_BATCH_LIMIT = 100;
+const DETAIL_THROTTLE_MS = 350;
+const HOME_URL           = "https://home.passline.com/home";
+const NO_CHANGE_COOLDOWN_MINUTES = 30;
 
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -62,17 +69,30 @@ interface VenueConfig {
 //   - Espacio HNN    → electronica
 
 const TARGET_VENUES: VenueConfig[] = [
-  { displayName: "La Residencia Club",  slug: "la-residencia-club",  defaultGenres: ["electronica"]                    },
-  { displayName: "La Casona de Camaná", slug: "la-casona-de-camana", defaultGenres: ["electronica"]                    },
-  { displayName: "Valetodo Downtown",   slug: "valetodo-downtown",   defaultGenres: ["electronica", "salsa", "latin-bass"] },
-  { displayName: "La Yunza",            slug: "la-yunza",            defaultGenres: ["electronica"]                    },
-  { displayName: "Espacio HNN",         slug: "espacio-hnn",         defaultGenres: ["electronica"]                    },
-  { displayName: "SISIFUZ",             slug: "sisifuz",             defaultGenres: ["electronica"]                    },
-  { displayName: "Baalsal",             slug: "baalsal",             defaultGenres: ["electronica"]                    },
+  // Central Beat Peru organiza eventos en La Residencia Club (Jr. Junín 429, Centro Histórico)
+  { displayName: "Central Beat Peru",   slug: "centralbeatperu",                    defaultGenres: ["electronica"] },
+  { displayName: "La Casona de Camaná", slug: "casona-de-camana-electronic-club",   defaultGenres: ["electronica"] },
+  { displayName: "Valetodo Downtown",   slug: "valetodo-downtown",                  defaultGenres: ["electronica", "salsa"] },
+  { displayName: "House Nation Lima",   slug: "house-nation-lima",                  defaultGenres: ["electronica"] },
+  // SISIFUZ eventos organizados por Round Trip Perú
+  { displayName: "SISIFUZ / Round Trip", slug: "round-trip",                        defaultGenres: ["electronica"] },
+  // Baalsaal Lima (Solar Music SAC)
+  { displayName: "Baalsaal Lima",       slug: "8583182-solar-music-sac",            defaultGenres: ["electronica"] },
 ];
 
 // Géneros electrónicos admitidos para estas venues
 const ELECTRONIC_SLUGS = new Set(["techno", "house", "electronica"]);
+const TARGET_VENUE_NAMES = new Set(TARGET_VENUES.map((venue) => normalizeVenueKey(venue.displayName)));
+const HOME_DISCOVERY_ACTIONS = [
+  { type: "scroll", direction: "down", amount: 1600 },
+  { type: "wait", milliseconds: 1200 },
+  { type: "scroll", direction: "down", amount: 1600 },
+  { type: "wait", milliseconds: 1200 },
+  { type: "scroll", direction: "down", amount: 1600 },
+  { type: "wait", milliseconds: 1200 },
+  { type: "scroll", direction: "down", amount: 1600 },
+  { type: "wait", milliseconds: 1200 },
+] as const;
 
 // ─── Date parser (Passline) ───────────────────────────────────────────────────
 //
@@ -150,6 +170,27 @@ function extractEventUrls(markdown: string): string[] {
   return urls;
 }
 
+function normalizeVenueKey(value: string | null | undefined): string {
+  return (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function isTargetVenue(value: string | null | undefined): boolean {
+  const normalized = normalizeVenueKey(value);
+  if (!normalized) return false;
+  if (TARGET_VENUE_NAMES.has(normalized)) return true;
+
+  for (const target of TARGET_VENUE_NAMES) {
+    if (normalized.includes(target) || target.includes(normalized)) return true;
+  }
+
+  return false;
+}
+
 // ─── Detail page parser ───────────────────────────────────────────────────────
 
 interface DetailData {
@@ -206,7 +247,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
   try {
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, venue_id, start_time")
+      .select("id, price_min, venue_id, start_time, is_active")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -214,7 +255,13 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
     const isUpdate = existing !== null;
     const writeRow = isUpdate
-      ? { ...row, price_min: row.price_min ?? existing.price_min, venue_id: row.venue_id ?? existing.venue_id, start_time: row.start_time ?? existing.start_time }
+      ? {
+          ...row,
+          price_min: row.price_min ?? existing.price_min,
+          venue_id: row.venue_id ?? existing.venue_id,
+          start_time: row.start_time ?? existing.start_time,
+          is_active: existing.is_active,
+        }
       : row;
 
     const { data: upserted, error: upsertErr } = await supabase
@@ -261,16 +308,54 @@ async function getVenueEventUrls(venue: VenueConfig): Promise<{ urls: string[]; 
   return { urls: [], credits: 0 };
 }
 
+async function getHomeEventUrls(): Promise<{ urls: string[]; credits: number }> {
+  try {
+    const { markdown } = await scrapeMarkdown(HOME_URL, {
+      waitFor: 3500,
+      actions: [...HOME_DISCOVERY_ACTIONS],
+    });
+    const urls = extractEventUrls(markdown);
+    console.log(`[sync-passline] home discovery: ${urls.length} eventos detectados`);
+    return { urls, credits: 1 };
+  } catch (error) {
+    console.warn("[sync-passline] home discovery falló:", error);
+    return { urls: [], credits: 0 };
+  }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
+async function run(detailLimit = DETAIL_BATCH_LIMIT, options: { forceRefresh?: boolean } = {}): Promise<SyncResult> {
+  const guard = await shouldSkipRecentNoChangeRun(supabase, {
+    source: SOURCE,
+    cooldownMinutes: NO_CHANGE_COOLDOWN_MINUTES,
+    forceRefresh: options.forceRefresh,
+  });
+  if (guard.skip) {
+    console.log(`[sync-passline] skip sin cambios recientes (${guard.cooldownMinutes} min)`);
+    return buildSkippedNoChangeResult(SOURCE, guard);
+  }
+
   const result = emptySyncResult();
   console.log(`[sync-passline] version=${SCRAPER_VERSION}`);
 
-  // 1. Descubrir URLs de eventos en cada venue
+  // 1. Descubrir URLs de eventos desde home + venues curadas
   const eventQueue: Array<{ url: string; venueName: string; defaultGenres: string[] }> = [];
   const seenUrls   = new Set<string>();
   let   credits    = 0;
+  let homeDiscovered = 0;
+  let venueDiscovered = 0;
+
+  const { urls: homeUrls, credits: homeCredits } = await getHomeEventUrls();
+  credits += homeCredits;
+
+  for (const url of homeUrls) {
+    if (!seenUrls.has(url)) {
+      seenUrls.add(url);
+      eventQueue.push({ url, venueName: "", defaultGenres: ["electronica"] });
+      homeDiscovered += 1;
+    }
+  }
 
   for (const venue of TARGET_VENUES) {
     const { urls, credits: c } = await getVenueEventUrls(venue);
@@ -279,16 +364,58 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
       if (!seenUrls.has(url)) {
         seenUrls.add(url);
         eventQueue.push({ url, venueName: venue.displayName, defaultGenres: venue.defaultGenres });
+        venueDiscovered += 1;
       }
     }
   }
 
   console.log(`[sync-passline] ${eventQueue.length} eventos únicos descubiertos en ${credits} créditos`);
+  result.diagnostics = {
+    discovered: eventQueue.length,
+    parsed: eventQueue.length,
+    detail_fetched: 0,
+    skipped_reasons: {},
+    home_discovered: homeDiscovered,
+    venue_discovered: venueDiscovered,
+    target_venues: TARGET_VENUES.map((venue) => venue.displayName),
+  };
+
+  const markSkipped = (reason: string) => {
+    result.skipped += 1;
+    const bucket = result.diagnostics?.skipped_reasons ?? {};
+    bucket[reason] = (bucket[reason] ?? 0) + 1;
+    if (result.diagnostics) result.diagnostics.skipped_reasons = bucket;
+  };
 
   // 2. Scrape detail pages (limitado por detailLimit)
   const toProcess = eventQueue.slice(0, detailLimit);
 
-  for (const { url: ticket_url, venueName, defaultGenres } of toProcess) {
+  // Pre-check: fetch which URLs already have complete data in DB (name + date + start_time).
+  // This avoids burning a Firecrawl credit for events we already know fully.
+  const toProcessUrls = toProcess.map((e) => e.url);
+  const { data: alreadyComplete } = await supabase
+    .from("events")
+    .select("ticket_url")
+    .in("ticket_url", toProcessUrls)
+    .not("name", "is", null)
+    .not("date", "is", null)
+    .not("start_time", "is", null);
+  const completeSet = new Set((alreadyComplete ?? []).map((r: { ticket_url: string }) => r.ticket_url));
+  const actualToProcess = toProcess.filter((e) => !completeSet.has(e.url));
+  const preSkipped = toProcess.length - actualToProcess.length;
+  if (preSkipped > 0) {
+    console.log(`[sync-passline] ${preSkipped} eventos ya completos en DB — sin scrape de detalle`);
+    result.skipped += preSkipped;
+    const bucket = result.diagnostics?.skipped_reasons ?? {};
+    bucket["already_complete_in_db"] = preSkipped;
+    if (result.diagnostics) result.diagnostics.skipped_reasons = bucket;
+  }
+
+  if (result.diagnostics) {
+    result.diagnostics.detail_fetched = actualToProcess.length;
+  }
+
+  for (const { url: ticket_url, venueName, defaultGenres } of actualToProcess) {
     try {
       const { markdown } = await scrapeMarkdown(ticket_url, { waitFor: 2000 });
       credits += 1;
@@ -297,13 +424,25 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
 
       if (!detail.name || !detail.date) {
         console.warn(`[sync-passline] sin nombre/fecha en ${ticket_url}`);
-        result.skipped += 1;
+        markSkipped("missing_identity");
         await sleep(DETAIL_THROTTLE_MS);
         continue;
       }
 
       if (new Date(detail.date) < MIN_DATE) {
-        result.skipped += 1;
+        markSkipped("before_min_date");
+        await sleep(DETAIL_THROTTLE_MS);
+        continue;
+      }
+
+      if (!isTargetVenue(detail.venue_raw ?? venueName)) {
+        markSkipped("outside_target_venues");
+        await sleep(DETAIL_THROTTLE_MS);
+        continue;
+      }
+
+      if (isExcludedEvent(detail.name, detail.venue_raw)) {
+        markSkipped(EXCLUDED_SKIP_REASON);
         await sleep(DETAIL_THROTTLE_MS);
         continue;
       }
@@ -361,9 +500,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
   }
   try {
-    const body        = await req.json().catch(() => ({}));
-    const detailLimit = typeof body.detailLimit === "number" ? body.detailLimit : DETAIL_BATCH_LIMIT;
-    const result      = await run(detailLimit);
+    const body        = await req.json().catch(() => ({})) as { detailLimit?: number; force_refresh?: boolean };
+    const requestedLimit = typeof body.detailLimit === "number" ? body.detailLimit : DETAIL_BATCH_LIMIT;
+    const detailLimit = Math.max(1, Math.min(requestedLimit, 200));
+    const result      = await run(detailLimit, { forceRefresh: body.force_refresh === true });
     return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
   } catch (err) {
     console.error("[sync-passline]", err);
@@ -383,9 +523,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
 //   3. Ese link apunta a passline.com/productora/SLUG o passline.com/venue/SLUG
 //   4. Actualizar TARGET_VENUES con el slug correcto
 //
-// Slugs confirmados por búsqueda web:
-//   - valetodo-downtown  → passline.com/productora/valetodo-downtown ✓
+// Slugs confirmados:
+//   - valetodo-downtown              → passline.com/productora/valetodo-downtown ✓
+//   - centralbeatperu                → passline.com/productora/centralbeatperu ✓ (La Residencia Club)
+//   - casona-de-camana-electronic-club → passline.com/productora/casona-de-camana-electronic-club ✓
+//   - house-nation-lima              → passline.com/productora/house-nation-lima (Espacio HNN)
+//   - round-trip                     → passline.com/productora/round-trip (SISIFUZ / Round Trip Perú)
+//   - 8583182-solar-music-sac        → passline.com/productora/8583182-solar-music-sac (Baalsaal Lima)
 //
-// Slugs a verificar en primer run (revisar logs):
-//   - la-residencia-club, la-casona-de-camana, la-yunza,
-//     espacio-hnn, sisifuz, baalsal
+// La Yunza Lima: no existe en Passline como venue de electrónica (removida).

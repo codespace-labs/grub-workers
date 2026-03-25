@@ -1,7 +1,6 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
+import { scrapeHtml, scrapeMarkdown }   from "../_shared/firecrawl.ts";
 import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
-import { isMusicalEvent }               from "../_shared/music-filter.ts";
 import {
   emptySyncResult,
   toEventRow,
@@ -16,6 +15,11 @@ import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
 } from "../_shared/location-normalization.ts";
+import {
+  buildSkippedNoChangeResult,
+  shouldSkipRecentNoChangeRun,
+} from "../_shared/sync-guard.ts";
+import { isExcludedEvent, EXCLUDED_SKIP_REASON } from "../_shared/event-filter.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -24,7 +28,8 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "
 
 const LISTING_URL     = "https://www.ticketmaster.pe/page/categoria-conciertos";
 const SOURCE          = "ticketmaster" as const;
-const SCRAPER_VERSION = "2026-03-19.1";
+const SCRAPER_VERSION = "2026-03-19.2";
+const NO_CHANGE_COOLDOWN_MINUTES = 30;
 
 // Detalle solo para precio (fecha y hora ya vienen del listing)
 const DETAIL_BATCH_LIMIT = 0;
@@ -46,49 +51,60 @@ interface ListingEvent {
 }
 
 // ─── Listing parser ───────────────────────────────────────────────────────────
-//
-// Estructura del markdown (post-normalización de \\+newline):
-//
-//   [![NAME](https://cdn.getcrowder.com/...)
-//   NAME
-//   **VENUE** DAY DD de MES - HH:MMpm](https://www.ticketmaster.pe/event/SLUG)
-//
-// Nombre viene como alt text de la imagen y repetido como texto.
-// Venue en **bold**. Fecha y hora en la misma línea post-venue.
 
-function normalizeBreaks(md: string): string {
-  return md
-    .replace(/\\\\\n/g, " ")
-    .replace(/\\\s+/g, " ")
-    .replace(/\s{2,}/g, " ");
+function decodeHtml(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&ntilde;/g, "ñ")
+    .replace(/&Ntilde;/g, "Ñ")
+    .replace(/&aacute;/g, "á")
+    .replace(/&eacute;/g, "é")
+    .replace(/&iacute;/g, "í")
+    .replace(/&oacute;/g, "ó")
+    .replace(/&uacute;/g, "ú")
+    .replace(/&Aacute;/g, "Á")
+    .replace(/&Eacute;/g, "É")
+    .replace(/&Iacute;/g, "Í")
+    .replace(/&Oacute;/g, "Ó")
+    .replace(/&Uacute;/g, "Ú")
+    .replace(/&uuml;/g, "ü")
+    .replace(/&Uuml;/g, "Ü")
+    .replace(/&deg;/g, "°")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => {
+      const num = Number(code);
+      return Number.isFinite(num) ? String.fromCharCode(num) : "";
+    });
 }
 
-function parseListingMarkdown(markdown: string): ListingEvent[] {
-  const clean  = normalizeBreaks(markdown);
-  const chunks = clean.split(/(?=\[!\[)/);
+function normalizeWhitespace(value: string): string {
+  return decodeHtml(value)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseListingHtml(html: string): { events: ListingEvent[]; cardCount: number } {
+  const anchorRe = /<a\s+href=['"]\.\.\/event\/([^'"]+)['"][\s\S]*?<img[^>]+src=['"]([^'"]+)['"][^>]*alt=['"]([^'"]*)['"][\s\S]*?<strong>([^<]+)<\/strong>\s*<span>([^<]+)<\/span>[\s\S]*?<\/a>/gi;
+  const seen = new Set<string>();
   const events: ListingEvent[] = [];
-  const seen   = new Set<string>();
+  let cardCount = 0;
+  let match: RegExpExecArray | null;
 
-  for (const chunk of chunks) {
-    if (!chunk.includes("getcrowder.com")) continue;
-
-    // cover + name (alt text)
-    const imgM = chunk.match(/\[!\[([^\]]*)\]\((https:\/\/cdn\.getcrowder\.com\/[^)]+)\)/);
-    if (!imgM) continue;
-
-    // ticket_url + slug
-    const urlM = chunk.match(/\]\((https:\/\/www\.ticketmaster\.pe\/event\/([^)]+))\)\s*$/);
-    if (!urlM) continue;
-
-    const ticket_url = urlM[1];
+  while ((match = anchorRe.exec(html)) !== null) {
+    cardCount += 1;
+    const slug = match[1].trim();
+    const ticket_url = new URL(`../event/${slug}`, LISTING_URL).toString();
     if (seen.has(ticket_url)) continue;
     seen.add(ticket_url);
 
-    // venue (bold) + date+time (resto de la línea)
-    const venueM    = chunk.match(/\*\*([^*]+)\*\*\s+(.+?)(?:\]\(https:\/\/www\.ticketmaster)/);
-    const name      = imgM[1].trim();
-    const venue_raw = venueM?.[1]?.trim() ?? null;
-    const date_raw  = venueM?.[2]?.trim() ?? "";
+    const name = normalizeWhitespace(match[3]);
+    const venue_raw = normalizeWhitespace(match[4]) || null;
+    const date_raw = normalizeWhitespace(match[5]);
+    const cover_url = match[2].trim() || null;
 
     if (!name || !date_raw) continue;
 
@@ -96,13 +112,13 @@ function parseListingMarkdown(markdown: string): ListingEvent[] {
       name,
       venue_raw,
       date_raw,
-      cover_url:  imgM[2],
+      cover_url,
       ticket_url,
-      slug:       urlM[2],
+      slug,
     });
   }
 
-  return events;
+  return { events, cardCount };
 }
 
 // ─── Detail page ──────────────────────────────────────────────────────────────
@@ -135,7 +151,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
   try {
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, start_time, venue_id")
+      .select("id, price_min, start_time, venue_id, is_active")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -143,7 +159,13 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
     const isUpdate = existing !== null;
     const writeRow = isUpdate
-      ? { ...row, price_min: row.price_min ?? existing.price_min, start_time: row.start_time ?? existing.start_time, venue_id: row.venue_id ?? existing.venue_id }
+      ? {
+          ...row,
+          price_min: row.price_min ?? existing.price_min,
+          start_time: row.start_time ?? existing.start_time,
+          venue_id: row.venue_id ?? existing.venue_id,
+          is_active: existing.is_active,
+        }
       : row;
 
     const { data: upserted, error: upsertErr } = await supabase
@@ -164,22 +186,46 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
+async function run(detailLimit = DETAIL_BATCH_LIMIT, options: { forceRefresh?: boolean } = {}): Promise<SyncResult> {
+  const guard = await shouldSkipRecentNoChangeRun(supabase, {
+    source: SOURCE,
+    cooldownMinutes: NO_CHANGE_COOLDOWN_MINUTES,
+    forceRefresh: options.forceRefresh,
+  });
+  if (guard.skip) {
+    console.log(`[sync-ticketmaster-pe] skip sin cambios recientes (${guard.cooldownMinutes} min)`);
+    return buildSkippedNoChangeResult(SOURCE, guard);
+  }
+
   const result = emptySyncResult();
   console.log(`[sync-ticketmaster-pe] version=${SCRAPER_VERSION}`);
 
-  const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 2000 });
-  const listings     = parseListingMarkdown(markdown);
+  const { html } = await scrapeHtml(LISTING_URL, { waitFor: 2000 });
+  const { events: listings, cardCount } = parseListingHtml(html);
 
   const todayLima = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Lima" }));
   todayLima.setHours(0, 0, 0, 0);
 
-  // Filtrar: música, desde MIN_DATE
+  const skippedReasons: Record<string, number> = {};
+  const countSkip = (reason: string) => {
+    result.skipped += 1;
+    skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+  };
+
+  // Filtrar solo por fecha válida y mínima; el filtro editorial vive después.
   const valid = listings.filter((e) => {
-    if (!isMusicalEvent(e.name, e.venue_raw ?? "")) return false;
     const { date } = parseTicketmasterPeDateTime(e.date_raw);
-    if (!date) return false;
-    return new Date(date) >= MIN_DATE;
+    if (!date) {
+      countSkip("invalid_date");
+      return false;
+    }
+
+    if (new Date(date) < MIN_DATE) {
+      countSkip("before_min_date");
+      return false;
+    }
+
+    return true;
   });
 
   const futureListings = valid.filter((e) => {
@@ -187,7 +233,19 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
     return date ? new Date(date) >= todayLima : false;
   });
 
-  console.log(`[sync-ticketmaster-pe] ${listings.length} total → ${valid.length} válidos (${futureListings.length} futuros)`);
+  result.diagnostics = {
+    discovered: listings.length,
+    parsed: valid.length,
+    detail_fetched: Math.min(futureListings.length, detailLimit),
+    raw_cards: cardCount,
+    future_listings: futureListings.length,
+    skipped_reasons: skippedReasons,
+  };
+
+  console.log(
+    `[sync-ticketmaster-pe] ${listings.length} descubiertos (${cardCount} cards crudas)` +
+    ` → ${valid.length} válidos (${futureListings.length} futuros)`,
+  );
 
   // Detalle solo futuros (solo precio — fecha y hora ya están en listing)
   const toEnrich = futureListings.slice(0, detailLimit);
@@ -200,7 +258,15 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
 
   for (const listing of valid) {
     const { date, start_time } = parseTicketmasterPeDateTime(listing.date_raw);
-    if (!date) { result.skipped += 1; continue; }
+    if (!date) {
+      countSkip("invalid_date");
+      continue;
+    }
+
+    if (isExcludedEvent(listing.name, listing.venue_raw)) {
+      countSkip(EXCLUDED_SKIP_REASON);
+      continue;
+    }
 
     const event: UnifiedEvent = {
       source:          SOURCE,
@@ -240,7 +306,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   try {
     const body        = await req.json().catch(() => ({}));
     const detailLimit = typeof body.detailLimit === "number" ? body.detailLimit : DETAIL_BATCH_LIMIT;
-    const result      = await run(detailLimit);
+    const result      = await run(detailLimit, { forceRefresh: body.force_refresh === true });
     return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
   } catch (err) {
     console.error("[sync-ticketmaster-pe]", err);

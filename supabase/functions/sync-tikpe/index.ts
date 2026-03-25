@@ -1,15 +1,13 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
 import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
+import { isExcludedEvent, EXCLUDED_SKIP_REASON } from "../_shared/event-filter.ts";
 import {
   emptySyncResult,
   toEventRow,
-  parseTikPeDate,
   validatePrice,
   type UnifiedEvent,
   type SyncResult,
 } from "../_shared/normalizer.ts";
-import { upsertVenue }            from "../_shared/venue-upsert.ts";
 import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
@@ -20,116 +18,166 @@ import {
 const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")              ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-const BASE_URL        = "https://tik.pe/events";
+const BASE_URL        = "https://tik.pe";
+const EVENTS_API_URL  = `${BASE_URL}/events/api/get_events`;
 const SOURCE          = "tikpe" as const;
-const SCRAPER_VERSION = "2026-03-19.1";
+const SCRAPER_VERSION = "2026-03-19.2";
 const MIN_DATE        = new Date("2026-01-01T00:00:00-05:00");
 
-// Categorías permitidas (en minúsculas, sin tildes)
-const ALLOWED_CATEGORIES = new Set(["electronica", "conciertos"]);
+const CATEGORY_FILTERS = [
+  "Electronica",
+  "Conciertos",
+  "Fiestas",
+] as const;
 
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface ListingEvent {
-  name:       string;        // puede estar truncado ("Nombre del evento")
-  date_raw:   string;        // "25 mar. 2023"
-  category:   string;        // "Electronica" | "Conciertos"
-  city:       string;
-  price_min:  number | null; // en PEN (= S/)
-  ticket_url: string;
-  slug:       string;
+interface TikPeTicket {
+  price?: string | number | null;
+  sale_price?: string | number | null;
 }
 
-// ─── Listing parser ───────────────────────────────────────────────────────────
-//
-// Estructura del markdown de tik.pe/events?page=N:
-//
-//   25 mar. 2023
-//
-//   ##### [BBR & House Nation Pres. Alish...](https://tik.pe/events/bbr-house-nation-pres-alisha-uk)
-//
-//   Electronica
-//
-//   Lima
-//
-//   40.00 PEN
-//   / GENERAL
-//
-// Múltiples eventos pueden compartir la misma línea de fecha.
-// Los nombres vienen truncados con "..." — se almacenan limpios.
-// Venue NO está en listing. Cover NO está en listing.
-// Precio en PEN = S/. Se aplica validatePrice (umbral S/ 30).
-// Categorías a incluir: Electronica, Conciertos. Se descartan Fiestas, etc.
-
-function parseMaxPage(markdown: string): number {
-  // Busca ?page=N en links de paginación
-  const matches = [...markdown.matchAll(/[?&]page=(\d+)/g)];
-  if (!matches.length) return 1;
-  return Math.max(...matches.map((m) => parseInt(m[1], 10)));
+interface TikPeEventPayload {
+  id: number;
+  title?: string | null;
+  description?: string | null;
+  excerpt?: string | null;
+  venue?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  start_time?: string | null;
+  slug?: string | null;
+  thumbnail?: string | null;
+  poster?: string | null;
+  images?: string | null;
+  category_name?: string | null;
+  tickets?: TikPeTicket[] | null;
+  publish?: number | null;
+  status?: number | null;
 }
 
-function normalizeCategory(raw: string): string {
-  return raw
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
+interface TikPeEventsEnvelope {
+  data?: TikPeEventPayload[];
+  current_page?: number;
+  last_page?: number;
+}
+
+interface TikPeEventsResponse {
+  events?: TikPeEventsEnvelope;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function stripHtml(html: string | null | undefined): string | null {
+  if (!html) return null;
+  const cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#039;/gi, "'")
+    .replace(/&aacute;/gi, "a")
+    .replace(/&eacute;/gi, "e")
+    .replace(/&iacute;/gi, "i")
+    .replace(/&oacute;/gi, "o")
+    .replace(/&uacute;/gi, "u")
+    .replace(/&ntilde;/gi, "n")
+    .replace(/&Aacute;/gi, "A")
+    .replace(/&Eacute;/gi, "E")
+    .replace(/&Iacute;/gi, "I")
+    .replace(/&Oacute;/gi, "O")
+    .replace(/&Uacute;/gi, "U")
+    .replace(/&Ntilde;/gi, "N")
+    .replace(/\s+/g, " ")
     .trim();
+
+  return cleaned || null;
 }
 
-function parseListingMarkdown(markdown: string): ListingEvent[] {
-  const events: ListingEvent[] = [];
-  const seen   = new Set<string>();
+function toAbsoluteStorageUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  const trimmed = path.trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `${BASE_URL}/storage/${trimmed.replace(/^\/+/, "")}`;
+}
 
-  // 1. Localizar todos los marcadores de fecha y su posición en el string
-  //    Formato: "25 mar. 2023" o "4 abr. 2026"
-  const DATE_RE = /\b(\d{1,2}\s+[a-z]+\.?\s+\d{4})\b/gi;
-  const dateMarkers: Array<{ pos: number; raw: string }> = [];
-  let dm: RegExpExecArray | null;
-  while ((dm = DATE_RE.exec(markdown)) !== null) {
-    dateMarkers.push({ pos: dm.index, raw: dm[1] });
+function extractImageFromImagesField(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      const first = parsed.find((value) => typeof value === "string" && value.trim().length > 0);
+      return typeof first === "string" ? toAbsoluteStorageUrl(first) : null;
+    }
+  } catch {
+    // ignore malformed JSON and continue with null
+  }
+  return null;
+}
+
+function buildTicketUrl(slug: string): string {
+  return `${BASE_URL}/events/${encodeURIComponent(slug)}`;
+}
+
+function toIsoDate(dateRaw: string | null | undefined, timeRaw: string | null | undefined): string | null {
+  if (!dateRaw || !/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) return null;
+  const time = timeRaw && /^\d{2}:\d{2}:\d{2}$/.test(timeRaw) ? timeRaw : "00:00:00";
+  return `${dateRaw}T${time}-05:00`;
+}
+
+function parseNumeric(value: string | number | null | undefined): number | null {
+  if (value == null) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const normalized = value.replace(/,/g, ".").trim();
+  if (!normalized) return null;
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractPriceMin(tickets: TikPeTicket[] | null | undefined): number | null {
+  if (!tickets?.length) return null;
+  const values = tickets
+    .flatMap((ticket) => [parseNumeric(ticket.sale_price), parseNumeric(ticket.price)])
+    .filter((value): value is number => value != null && Number.isFinite(value) && value > 0);
+
+  if (!values.length) return null;
+  return validatePrice(Math.min(...values));
+}
+
+async function fetchListingPage(category: string, page: number): Promise<TikPeEventsEnvelope> {
+  const params = new URLSearchParams({
+    page: String(page),
+    category,
+    search: "",
+    start_date: "",
+    end_date: "",
+    price: "",
+    city: "All",
+    state: "All",
+    country: "All",
+  });
+
+  const res = await fetch(`${EVENTS_API_URL}?${params.toString()}`, {
+    headers: {
+      "Accept": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} leyendo ${category} página ${page}`);
   }
 
-  // 2. Localizar cada bloque de evento por su heading Markdown (##### [...](URL))
-  //    La línea siguiente es la categoría, luego la ciudad, luego el precio.
-  const EVENT_RE =
-    /#{1,6}\s+\[([^\]]+)\]\((https:\/\/tik\.pe\/events\/([^\s)]+))\)\s*\n+\s*([^\n]+)\s*\n+\s*([^\n]+)\s*\n+\s*([\d.]+)\s+PEN/g;
-  let em: RegExpExecArray | null;
-
-  while ((em = EVENT_RE.exec(markdown)) !== null) {
-    const [, name_raw, ticket_url, slug, category_raw, city_raw, price_raw] = em;
-
-    if (seen.has(ticket_url)) continue;
-    seen.add(ticket_url);
-
-    // Filtrar categorías no musicales
-    const catNorm = normalizeCategory(category_raw);
-    if (!ALLOWED_CATEGORIES.has(catNorm)) continue;
-
-    // Fecha más cercana que aparece ANTES de este heading
-    const pos = em.index;
-    const nearestDate = [...dateMarkers].reverse().find((d) => d.pos < pos);
-    if (!nearestDate) continue;
-
-    // Nombre: limpiar truncamiento ("Nombre del eve..." → "Nombre del eve")
-    const name = name_raw.trim().replace(/\.{3}$/, "").trim();
-    if (!name) continue;
-
-    const price = parseFloat(price_raw);
-
-    events.push({
-      name,
-      date_raw:  nearestDate.raw,
-      category:  category_raw.trim(),
-      city:      city_raw.trim(),
-      price_min: Number.isFinite(price) ? price : null,
-      ticket_url,
-      slug,
-    });
-  }
-
-  return events;
+  const json = await res.json() as TikPeEventsResponse;
+  return json.events ?? {};
 }
 
 // ─── Upsert ───────────────────────────────────────────────────────────────────
@@ -137,17 +185,27 @@ function parseListingMarkdown(markdown: string): ListingEvent[] {
 type UpsertOutcome = "inserted" | "updated" | "failed";
 
 async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
-  const loc = resolveEventLocation({ rawVenue: null, rawName: event.name, explicitCity: event.city });
+  const loc = resolveEventLocation({
+    rawVenue: event.venue ?? null,
+    rawName: event.name,
+    explicitCity: event.city,
+  });
 
   const row = toEventRow(
-    { ...event, name: stripTrailingCityFromEventName(event.name, loc.city), venue: null, city: loc.city, country_code: loc.country_code },
+    {
+      ...event,
+      name: stripTrailingCityFromEventName(event.name, loc.city),
+      venue: event.venue ?? null,
+      city: loc.city,
+      country_code: loc.country_code,
+    },
     null,
   );
 
   try {
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, venue_id")
+      .select("id, price_min, venue_id, is_active")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -155,7 +213,12 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
     const isUpdate = existing !== null;
     const writeRow = isUpdate
-      ? { ...row, price_min: row.price_min ?? existing.price_min, venue_id: row.venue_id ?? existing.venue_id }
+      ? {
+        ...row,
+        price_min: row.price_min ?? existing.price_min,
+        venue_id: row.venue_id ?? existing.venue_id,
+        is_active: existing.is_active,
+      }
       : row;
 
     const { data: upserted, error: upsertErr } = await supabase
@@ -176,92 +239,110 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-// Página máxima a probar si la paginación no es detectable en el markdown.
-// tik.pe tenía ~8 páginas en Mar-2026; 20 es un techo seguro sin desperdiciar créditos.
-const MAX_PAGE_PROBE = 20;
-
 async function run(): Promise<SyncResult> {
   const result = emptySyncResult();
   console.log(`[sync-tikpe] version=${SCRAPER_VERSION}`);
 
-  // Paso 1: scrape página 1 — intenta detectar maxPage de los links de paginación.
-  // tik.pe usa paginación JS-only → parseMaxPage devuelve 1 si no hay links en el markdown.
-  const { markdown: page1Md } = await scrapeMarkdown(BASE_URL, { waitFor: 2500 });
-  const detectedMax = parseMaxPage(page1Md);
-  const maxPage     = detectedMax > 1 ? detectedMax : MAX_PAGE_PROBE;
-  console.log(`[sync-tikpe] maxPage detectado=${detectedMax}, usando=${maxPage}`);
+  const allEvents: TikPeEventPayload[] = [];
+  const seen = new Set<string>();
+  let pagesFetched = 0;
 
-  let creditsUsed = 1;
-  let allListings: ListingEvent[] = [];
-  const page1Events = parseListingMarkdown(page1Md);
+  for (const category of CATEGORY_FILTERS) {
+    const firstPage = await fetchListingPage(category, 1);
+    const lastPage = Math.max(1, firstPage.last_page ?? 1);
+    const pageOneEvents = firstPage.data ?? [];
+    pagesFetched += 1;
 
-  // Paso 2: scrape desde la última página hacia la primera.
-  // - Si la página retorna 0 eventos → hemos superado el máximo real → parar.
-  // - Si todos los eventos son anteriores a MIN_DATE → parar (resto es más antiguo aún).
-  for (let page = maxPage; page >= 2; page--) {
-    const url = `${BASE_URL}?page=${page}`;
-    const { markdown } = await scrapeMarkdown(url, { waitFor: 2500 });
-    creditsUsed += 1;
+    console.log(`[sync-tikpe] ${category}: página 1 con ${pageOneEvents.length} eventos, lastPage=${lastPage}`);
 
-    const pageEvents = parseListingMarkdown(markdown);
-    console.log(`[sync-tikpe] página ${page}: ${pageEvents.length} eventos parseados`);
-
-    // Página vacía → superamos el máximo real
-    if (pageEvents.length === 0) {
-      console.log(`[sync-tikpe] página ${page} vacía → max real encontrado`);
-      continue; // sigue hacia páginas menores
+    for (const item of pageOneEvents) {
+      const key = item.slug?.trim() || String(item.id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        allEvents.push(item);
+      }
     }
 
-    allListings = allListings.concat(pageEvents);
+    for (let page = 2; page <= lastPage; page++) {
+      const nextPage = await fetchListingPage(category, page);
+      const pageEvents = nextPage.data ?? [];
+      pagesFetched += 1;
+      console.log(`[sync-tikpe] ${category}: página ${page} con ${pageEvents.length} eventos`);
 
-    const allBeforeMinDate = pageEvents.every((e) => {
-      const d = parseTikPeDate(e.date_raw);
-      return !d || new Date(d) < MIN_DATE;
-    });
-
-    if (allBeforeMinDate) {
-      console.log(`[sync-tikpe] página ${page} toda antes de MIN_DATE → deteniendo paginación`);
-      break;
+      for (const item of pageEvents) {
+        const key = item.slug?.trim() || String(item.id);
+        if (!seen.has(key)) {
+          seen.add(key);
+          allEvents.push(item);
+        }
+      }
     }
   }
 
-  allListings = allListings.concat(page1Events);
+  result.diagnostics = {
+    discovered: allEvents.length,
+    parsed: allEvents.length,
+    detail_fetched: 0,
+    skipped_reasons: {},
+    pages_fetched: pagesFetched,
+  };
 
-  // Deduplicar por ticket_url (por si las páginas extremas se solapan)
-  const seen = new Set<string>();
-  const listings = allListings.filter((e) => {
-    if (seen.has(e.ticket_url)) return false;
-    seen.add(e.ticket_url);
-    return true;
-  });
+  const markSkipped = (reason: string) => {
+    result.skipped += 1;
+    const bucket = result.diagnostics?.skipped_reasons ?? {};
+    bucket[reason] = (bucket[reason] ?? 0) + 1;
+    if (result.diagnostics) result.diagnostics.skipped_reasons = bucket;
+  };
 
-  console.log(`[sync-tikpe] ${listings.length} eventos únicos tras paginación`);
+  for (const item of allEvents) {
+    const slug = item.slug?.trim();
+    const name = item.title?.trim();
+    const date = toIsoDate(item.start_date, item.start_time);
 
-  for (const listing of listings) {
-    const date = parseTikPeDate(listing.date_raw);
-
-    if (!date || new Date(date) < MIN_DATE) {
-      result.skipped += 1;
+    if (!slug || !name) {
+      markSkipped("missing_identity");
       continue;
     }
 
+    if (isExcludedEvent(name, item.venue ?? null)) {
+      markSkipped(EXCLUDED_SKIP_REASON);
+      continue;
+    }
+
+    if (!date || new Date(date) < MIN_DATE) {
+      markSkipped(!date ? "invalid_date" : "before_min_date");
+      continue;
+    }
+
+    const cover_url =
+      toAbsoluteStorageUrl(item.poster) ??
+      toAbsoluteStorageUrl(item.thumbnail) ??
+      extractImageFromImagesField(item.images);
+
+    const description = stripHtml(item.description) ?? stripHtml(item.excerpt);
+    const city = item.city?.trim() || item.state?.trim() || "Lima";
+    const genre_slugs = inferGenres(
+      `${name} ${description ?? ""}`.trim(),
+      item.category_name ?? "",
+    );
+
     const event: UnifiedEvent = {
-      source:          SOURCE,
-      ticket_url:      listing.ticket_url,
-      external_slug:   listing.slug,
-      name:            listing.name,
+      source: SOURCE,
+      ticket_url: buildTicketUrl(slug),
+      external_slug: slug,
+      name,
       date,
-      start_time:      null,   // no disponible en listing
-      venue:           null,   // no disponible en listing
-      city:            listing.city || "Lima",
-      country_code:    "PE",
-      cover_url:       null,   // no disponible en listing
-      price_min:       validatePrice(listing.price_min),
-      price_max:       null,
-      lineup:          [],
-      description:     null,
-      genre_slugs:     inferGenres(listing.name, listing.category),
-      is_active:       true,
+      start_time: item.start_time ?? null,
+      venue: item.venue?.trim() || null,
+      city,
+      country_code: "PE",
+      cover_url,
+      price_min: extractPriceMin(item.tickets),
+      price_max: null,
+      lineup: [],
+      description,
+      genre_slugs,
+      is_active: (item.publish ?? 1) === 1 && (item.status ?? 1) === 1,
       scraper_version: SCRAPER_VERSION,
     };
 
@@ -270,8 +351,9 @@ async function run(): Promise<SyncResult> {
     else result[outcome] += 1;
   }
 
-  console.log(`[sync-tikpe] done — inserted:${result.inserted} updated:${result.updated} failed:${result.failed} skipped:${result.skipped}`);
-  console.log(`[sync-tikpe] créditos usados: ${creditsUsed} (${maxPage} páginas)`);
+  console.log(
+    `[sync-tikpe] done — inserted:${result.inserted} updated:${result.updated} failed:${result.failed} skipped:${result.skipped}`,
+  );
   return result;
 }
 
@@ -279,21 +361,26 @@ async function run(): Promise<SyncResult> {
 
 Deno.serve(async (req: Request): Promise<Response> => {
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json" },
+    });
   }
+
   try {
     const result = await run();
-    return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
   } catch (err) {
     console.error("[sync-tikpe]", err);
-    return new Response(JSON.stringify({ error: "Internal server error" }), { status: 500, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ error: "Internal server error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 });
 
 // DEPLOY: supabase functions deploy sync-tikpe --no-verify-jwt
-// SECRETS: FIRECRAWL_API_KEY
-// CRÉDITOS: hasta maxPage por run (1 por página scrapeada)
-//           En la práctica: pocas páginas si la mayoría son de 2023/2024 (MIN_DATE las descarta).
-// NOTA: Nombres en listing pueden estar truncados ("Nombre...").
-//       Cover e imagen no están disponibles en listing.
-//       Para enriquecer nombre/cover, implementar detail page fetch con detailLimit.
+// FUENTE: endpoint JSON público de tik.pe (más estable que el listing SPA)

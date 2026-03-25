@@ -1,11 +1,12 @@
 // ─── Music filter ─────────────────────────────────────────────────────────────
 //
-// Decide si un evento es musical o no antes de escribirlo en la DB.
+// Decide si un evento debe permitirse o excluirse antes de escribirlo en la DB.
 //
 // Lógica:
-//   1. Si nombre o venue contiene alguna MUSIC_SIGNAL → musical (sin más checks).
-//   2. Si nombre o venue contiene algún NON_MUSIC_KEYWORD → no musical.
-//   3. Default → musical (abierto por defecto, para no perder eventos).
+//   1. Si cae en una exclusión editorial dura → se bloquea.
+//   2. Si nombre o venue contiene alguna MUSIC_SIGNAL → musical.
+//   3. Si nombre contiene algún NON_MUSIC_KEYWORD → no musical.
+//   4. Default → musical.
 //
 // Los eventos no musicales se pueden upsertear con is_active = false
 // para revisión manual si se desea, pero la decisión de filtrarlos
@@ -28,11 +29,10 @@ const MUSIC_SIGNALS: ReadonlyArray<string> = [
   "dj set", "dj session",
   // Agrupaciones
   "banda", "band",
-  "tributo", "tribute",
   // Géneros (señales fuertes)
   "techno", "house",
   "reggaeton", "reggae",
-  "salsa", "cumbia", "merengue",
+  "salsa",
   "hip-hop", "hip hop", "rap",
   "indie", "rock", "metal",
   "edm", "rave", "electronica",
@@ -91,11 +91,73 @@ const NON_MUSIC_KEYWORDS: ReadonlyArray<string> = [
   "show infantil",
   "espectaculo infantil",
   "espectáculo infantil",
+  "infantil",
+  "para niños",
+  "para ninos",
+  "niños",
+  "ninos",
+  "kids",
 
   // Variedades
   "magia",
   "circo",
 ];
+
+const HARD_EXCLUSION_PATTERNS: ReadonlyArray<RegExp> = [
+  /\btributo\b/i,
+  /\btribute\b/i,
+  /\bhomenaje\b/i,
+  /\brevive\b/i,
+  /\bx siempre\b/i,
+  /\bcerati x siempre\b/i,
+  /\bpara ni(?:n|ñ)os\b/i,
+  /\bni(?:n|ñ)os?\b/i,
+  /\binfantil(?:es)?\b/i,
+  /\bkids?\b/i,
+  /\bcumbia\b/i,
+  /\bchicha\b/i,
+  /\bhuayno?s?\b/i,
+  /\bfolklor(?:e|ica|ico)\b/i,
+  /\bfolkl[oó]ric[ao]s?\b/i,
+  /\bandino?s?\b/i,
+  /\bcriollo?s?\b/i,
+];
+
+const HARD_EXCLUDED_GENRES = new Set([
+  "cumbia",
+  "cumbia-andina",
+  "folklore",
+]);
+
+function normalizeText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+export interface EditorialExclusionInput {
+  name: string;
+  venue?: string | null;
+  genreSlugs?: string[];
+  coverUrl?: string | null;
+}
+
+export function getEditorialExclusionReason(input: EditorialExclusionInput): string | null {
+  const nameNorm = normalizeText(input.name ?? "");
+  const venueNorm = normalizeText(input.venue ?? "");
+  const haystack = `${nameNorm} ${venueNorm}`.trim();
+
+  if (HARD_EXCLUSION_PATTERNS.some((pattern) => pattern.test(haystack))) {
+    return "editorial-blocked";
+  }
+
+  if ((input.genreSlugs ?? []).some((slug) => HARD_EXCLUDED_GENRES.has(slug))) {
+    return "excluded-genre";
+  }
+
+  return null;
+}
 
 // ─── isMusicalEvent ───────────────────────────────────────────────────────────
 
@@ -106,20 +168,15 @@ const NON_MUSIC_KEYWORDS: ReadonlyArray<string> = [
  * @param venue  Nombre del venue (opcional, solo para MUSIC_SIGNALS).
  */
 export function isMusicalEvent(name: string, venue = ""): boolean {
-  // Normalizar: quitar acentos, minúsculas
-  const haystack = `${name} ${venue}`
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
+  if (getEditorialExclusionReason({ name, venue })) return false;
+
+  const haystack = normalizeText(`${name} ${venue}`);
 
   // Señal positiva fuerte → es musical sin importar el resto
   if (MUSIC_SIGNALS.some((kw) => haystack.includes(kw))) return true;
 
   // Exclusiones chequeadas solo en el nombre (venues con "teatro" pueden tener conciertos)
-  const nameNorm = name
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
+  const nameNorm = normalizeText(name);
 
   if (NON_MUSIC_KEYWORDS.some((kw) => nameNorm.includes(kw))) return false;
 

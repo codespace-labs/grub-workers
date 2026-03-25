@@ -1,7 +1,6 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
 import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
-import { isMusicalEvent }               from "../_shared/music-filter.ts";
 import {
   emptySyncResult,
   toEventRow,
@@ -9,11 +8,15 @@ import {
   type UnifiedEvent,
   type SyncResult,
 } from "../_shared/normalizer.ts";
-import { upsertVenue }            from "../_shared/venue-upsert.ts";
 import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
 } from "../_shared/location-normalization.ts";
+import {
+  buildSkippedNoChangeResult,
+  shouldSkipRecentNoChangeRun,
+} from "../_shared/sync-guard.ts";
+import { isExcludedEvent, EXCLUDED_SKIP_REASON } from "../_shared/event-filter.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -22,8 +25,12 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "
 
 const LISTING_URL     = "https://www.joinnus.com/descubrir/concerts";
 const SOURCE          = "joinnus" as const;
-const SCRAPER_VERSION = "2026-03-19.1";
+const SCRAPER_VERSION = "2026-03-19.2";
 const MIN_DATE        = new Date("2026-01-01T00:00:00-05:00");
+const MAX_PAGE_PROBE  = 30;
+const MAX_EMPTY_PAGE_STREAK = 3;
+const MAX_NO_NEW_PAGE_STREAK = 3;
+const NO_CHANGE_COOLDOWN_MINUTES = 60;
 
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -101,12 +108,17 @@ function parseListingMarkdown(markdown: string): ListingEvent[] {
     // Joinnus muestra el precio real del sitio → aceptar cualquier valor > 0
     const price_min = rawPrice && rawPrice > 0 ? rawPrice : null;
 
-    if (!isMusicalEvent(name)) continue;
-
-    events.push({ name, city, date_raw, cover_url: imgM?.[2] ?? null, ticket_url, slug, price_min });
+    const cover_url = imgM?.[2] ?? null;
+    events.push({ name, city, date_raw, cover_url, ticket_url, slug, price_min });
   }
 
   return events;
+}
+
+function parseMaxPage(markdown: string): number {
+  const matches = [...markdown.matchAll(/[?&]page=(\d+)/gi)];
+  if (!matches.length) return 1;
+  return Math.max(...matches.map((match) => parseInt(match[1], 10)));
 }
 
 // ─── Upsert ───────────────────────────────────────────────────────────────────
@@ -124,7 +136,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
   try {
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, venue_id")
+      .select("id, price_min, venue_id, is_active")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -132,7 +144,12 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
     const isUpdate = existing !== null;
     const writeRow = isUpdate
-      ? { ...row, price_min: row.price_min ?? existing.price_min, venue_id: row.venue_id ?? existing.venue_id }
+      ? {
+          ...row,
+          price_min: row.price_min ?? existing.price_min,
+          venue_id: row.venue_id ?? existing.venue_id,
+          is_active: existing.is_active,
+        }
       : row;
 
     const { data: upserted, error: upsertErr } = await supabase
@@ -153,24 +170,113 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run(): Promise<SyncResult> {
+async function run(options: { forceRefresh?: boolean } = {}): Promise<SyncResult> {
+  const guard = await shouldSkipRecentNoChangeRun(supabase, {
+    source: SOURCE,
+    cooldownMinutes: NO_CHANGE_COOLDOWN_MINUTES,
+    forceRefresh: options.forceRefresh,
+  });
+  if (guard.skip) {
+    console.log(`[sync-joinnus] skip sin cambios recientes (${guard.cooldownMinutes} min)`);
+    return buildSkippedNoChangeResult(SOURCE, guard);
+  }
+
   const result = emptySyncResult();
   console.log(`[sync-joinnus] version=${SCRAPER_VERSION}`);
 
-  // Joinnus es una SPA React → waitFor alto para garantizar render completo
-  const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 3000 });
-  const listings     = parseListingMarkdown(markdown);
+  const { markdown: page1Markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 3000 });
+  const detectedMax = parseMaxPage(page1Markdown);
+  const maxPage = detectedMax > 1 ? detectedMax : MAX_PAGE_PROBE;
+  const allListings: ListingEvent[] = [];
+  let creditsUsed = 1;
+  let pagesFetched = 1;
+  let emptyPageStreak = 0;
+  let noNewPageStreak = 0;
 
-  const todayLima = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Lima" }));
-  todayLima.setHours(0, 0, 0, 0);
+  const seenTicketUrls = new Set<string>();
+  const appendUniqueListings = (pageListings: ListingEvent[]) => {
+    let newItems = 0;
+    for (const listing of pageListings) {
+      if (seenTicketUrls.has(listing.ticket_url)) continue;
+      seenTicketUrls.add(listing.ticket_url);
+      allListings.push(listing);
+      newItems += 1;
+    }
+    return newItems;
+  };
 
-  console.log(`[sync-joinnus] ${listings.length} eventos parseados del listing`);
+  const page1Listings = parseListingMarkdown(page1Markdown);
+  const initialNewItems = appendUniqueListings(page1Listings);
+
+  console.log(`[sync-joinnus] página 1: ${page1Listings.length} eventos parseados, ${initialNewItems} nuevos`);
+
+  for (let page = 2; page <= maxPage; page += 1) {
+    const url = `${LISTING_URL}?page=${page}`;
+    const { markdown } = await scrapeMarkdown(url, { waitFor: 3000 });
+    creditsUsed += 1;
+    pagesFetched += 1;
+
+    const pageListings = parseListingMarkdown(markdown);
+    console.log(`[sync-joinnus] página ${page}: ${pageListings.length} eventos parseados`);
+
+    if (pageListings.length === 0) {
+      emptyPageStreak += 1;
+      console.log(`[sync-joinnus] página ${page} vacía → streak ${emptyPageStreak}/${MAX_EMPTY_PAGE_STREAK}`);
+      if (emptyPageStreak >= MAX_EMPTY_PAGE_STREAK) {
+        console.log(`[sync-joinnus] demasiadas páginas vacías consecutivas → fin de paginación`);
+        break;
+      }
+      continue;
+    }
+
+    emptyPageStreak = 0;
+    const newItems = appendUniqueListings(pageListings);
+
+    if (newItems === 0) {
+      noNewPageStreak += 1;
+      console.log(`[sync-joinnus] página ${page} no agregó eventos nuevos → streak ${noNewPageStreak}/${MAX_NO_NEW_PAGE_STREAK}`);
+      if (noNewPageStreak >= MAX_NO_NEW_PAGE_STREAK) {
+        console.log(`[sync-joinnus] demasiadas páginas sin eventos nuevos → fin de paginación`);
+        break;
+      }
+      continue;
+    }
+
+    noNewPageStreak = 0;
+    console.log(`[sync-joinnus] página ${page}: ${newItems} eventos nuevos acumulados`);
+  }
+
+  const listings = allListings;
+
+  console.log(`[sync-joinnus] ${listings.length} eventos únicos tras paginación`);
+  result.diagnostics = {
+    discovered: listings.length,
+    parsed: listings.length,
+    detail_fetched: 0,
+    skipped_reasons: {},
+    pages_fetched: pagesFetched,
+    detected_max_page: detectedMax,
+    crawl_max_page: maxPage,
+    no_new_page_streak_limit: MAX_NO_NEW_PAGE_STREAK,
+  };
+
+  const markSkipped = (reason: string) => {
+    result.skipped += 1;
+    const bucket = result.diagnostics?.skipped_reasons ?? {};
+    bucket[reason] = (bucket[reason] ?? 0) + 1;
+    if (result.diagnostics) result.diagnostics.skipped_reasons = bucket;
+  };
 
   for (const listing of listings) {
     const date = parseShortDate(listing.date_raw);
 
     if (!date || new Date(date) < MIN_DATE) {
-      result.skipped += 1;
+      markSkipped(!date ? "invalid_date" : "before_min_date");
+      continue;
+    }
+
+    if (isExcludedEvent(listing.name)) {
+      markSkipped(EXCLUDED_SKIP_REASON);
       continue;
     }
 
@@ -200,7 +306,7 @@ async function run(): Promise<SyncResult> {
   }
 
   console.log(`[sync-joinnus] done — inserted:${result.inserted} updated:${result.updated} failed:${result.failed} skipped:${result.skipped}`);
-  console.log(`[sync-joinnus] créditos usados: 1 (solo listing, precio ya incluido)`);
+  console.log(`[sync-joinnus] créditos usados: ${creditsUsed}`);
   return result;
 }
 
@@ -211,7 +317,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
   }
   try {
-    const result = await run();
+    const body = await req.json().catch(() => ({})) as { force_refresh?: boolean };
+    const result = await run({ forceRefresh: body.force_refresh === true });
     return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
   } catch (err) {
     console.error("[sync-joinnus]", err);

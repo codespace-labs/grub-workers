@@ -1,80 +1,187 @@
 // ─── Genre mapper ─────────────────────────────────────────────────────────────
 //
-// Inferencia de géneros por keyword matching determinista.
+// Fuente de verdad para géneros canónicos en el sistema grub.
 //
-// REGLA PRINCIPAL: nunca usar LLM para géneros.
-// Los géneros que no se pueden inferir con certeza se dejan vacíos para que
-// enrich-artists los resuelva en el paso de enriquecimiento posterior.
+// Exporta:
+//   CANONICAL_GENRES          — lista fija de slugs canónicos (solo estos 15)
+//   mapToCanonicalGenre(raw)  — etiqueta explícita del scraper → slug | null
+//   inferGenres(name, venue)  — inferencia desde nombre del evento → slug[]
+//   linkGenres(supabase, id, slugs) — vincula slugs en event_genres (sin N+1)
 //
-// Esta es la única fuente de verdad para inferencia de géneros.
-// Antes estaba triplicada en sync-ticketmaster, sync-ticketmaster-pe y
-// sync-teleticket con pequeñas inconsistencias entre versiones.
-//
-// Slugs válidos (deben existir en la tabla `genres`):
-//   techno · house · reggaeton · salsa · cumbia · vallenato · bachata
-//   merengue · rock · hip-hop · trap · rnb · indie · electronica
-//   latin-bass · jazz · alternativo · kpop · pop · clasica
+// REGLA: nunca LLM. Géneros sin mapeo claro → null / [].
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─── Reglas ───────────────────────────────────────────────────────────────────
-//
-// Orden importa: las reglas más específicas van primero dentro del mismo slug.
-// Un evento puede tener varios géneros (set devuelve únicos).
+import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const GENRE_RULES: ReadonlyArray<[RegExp, string]> = [
-  // ── Electrónica ─────────────────────────────────────────────────────────────
-  [/\btechno\b/,                                                        "techno"],
-  [/\bhouse\b|tech\s*house|deep\s*house|afro\s*house|\bfunk\b|\bdisco\b/, "house"],
-  [/electro|edm|\brave\b|circoloco|creamfields|awakenings|\bultra\b/,    "electronica"],
-  [/latin[\s-]bass|\bbass\b/,                                           "latin-bass"],
+// ─── Géneros canónicos ────────────────────────────────────────────────────────
+// Esta lista es fija. No agregar slugs sin actualizar también la migración SQL.
 
-  // ── Urbano ──────────────────────────────────────────────────────────────────
-  [/reggaet/,                                                     "reggaeton"],
-  [/hip[\s-]hop|\brap\b/,                                         "hip-hop"],
-  [/\btrap\b/,                                                    "trap"],
-  [/r\s*&\s*b|\brnb\b|r'n'b/,                                    "rnb"],
-  [/\bsoul\b/,                                                    "rnb"],
+export const CANONICAL_GENRES = [
+  "rock",
+  "pop",
+  "electronica",
+  "hip-hop",
+  "reggaeton",
+  "metal",
+  "jazz",
+  "salsa",
+  "indie",
+  "urbano",
+  "clasica",
+  "cumbia",
+  "r-b",
+  "punk",
+  "alternativo",
+] as const;
 
-  // ── Latina ──────────────────────────────────────────────────────────────────
-  [/\bsalsa\b/,                                                   "salsa"],
-  [/cumbia/,                                                      "cumbia"],
-  [/vallenato/,                                                   "vallenato"],
-  [/bachata/,                                                     "bachata"],
-  [/merengue/,                                                    "merengue"],
+export type CanonicalGenreSlug = typeof CANONICAL_GENRES[number];
 
-  // ── Rock / alternativo ──────────────────────────────────────────────────────
-  [/\brock\b|metal|punk/,                                         "rock"],
-  [/blues/,                                                       "rock"],
-  [/\bindie\b/,                                                   "indie"],
-  [/\bfolk\b|flamenco/,                                           "alternativo"],
+// ─── Normalización ────────────────────────────────────────────────────────────
+// Misma lógica que _normalize_genre() en la migración SQL:
+//   lowercase → trim → quitar tildes → quitar paréntesis y contenido → trim final
 
-  // ── Pop ─────────────────────────────────────────────────────────────────────
-  [/k[\s-]?pop|kpop/,                                             "kpop"],
-  [/\bpop\b/,                                                     "pop"],
+export function normalizeGenreString(raw: string): string {
+  return raw
+    .toLowerCase()
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")   // quita tildes/acentos
+    .replace(/\s*\([^)]*\)/g, "")      // quita paréntesis y su contenido
+    .replace(/[/|·,]+/g, " ")          // normaliza separadores
+    .replace(/\s+/g, " ")              // colapsa espacios múltiples
+    .trim();
+}
 
-  // ── Acústico / instrumental ──────────────────────────────────────────────────
-  [/\bjazz\b/,                                                    "jazz"],
-  [/clasica|clasico|classical|sinfon|orquesta|filarmoni|guitarra\s+clasica/, "clasica"],
+// ─── Tabla de mapeo canónico ──────────────────────────────────────────────────
+// Orden importa: excluidos primero, luego los más específicos antes que los generales.
+// null = sin canónico válido (el evento/artista se guarda igual, sin ese género).
+
+const CANONICAL_MAP: ReadonlyArray<[RegExp, CanonicalGenreSlug | null]> = [
+  // ── Excluidos explícitamente (sin canónico en onboarding) ─────────────────
+  [/motivacional|conferencia|charla|talk|speaker/,                          null],
+  [/musica peruana|musica andina|criollo|chicha|huayno/,                    null],
+  [/folklore|folklorico|andino|andina|traditional/,                        null],
+  [/industrial|shoegaze|prog(ressive)? rock|world music|new age|spoken/,   null],
+  [/ambiente|ambient/,                                                      null],
+
+  // ── Electrónica ─────────────────────────────────────────────────────────
+  [/electroni|electro|edm|techno|house|eurodance|ebm|electronic body/,    "electronica"],
+  [/trance|minimal|dnb|drum.?n.?bass|breakbeat|\brave\b|dance.?music/,    "electronica"],
+  [/latin.?bass|bass\s*music/,                                             "electronica"],
+
+  // ── Metal ───────────────────────────────────────────────────────────────
+  [/nu.?metal|alt(ernativo)?.?metal|death.?metal|black.?metal/,           "metal"],
+  [/thrash|heavy.?metal|metal\s*alternativo|metal$/,                      "metal"],
+  [/^metal/,                                                               "metal"],
+
+  // ── Punk ────────────────────────────────────────────────────────────────
+  [/post.?punk|punk.?rock|^punk$|hardcore/,                               "punk"],
+
+  // ── Rock (después de metal/punk para no capturar "punk rock" aquí) ──────
+  [/rock.?alternativo|alternative.?rock/,                                  "rock"],
+  [/^rock$|^rock |classic.?rock|hard.?rock|garage.?rock|grunge|blues/,    "rock"],
+
+  // ── Indie ───────────────────────────────────────────────────────────────
+  [/indie.?folk|indie.?pop|indie.?rock|^indie$/,                          "indie"],
+
+  // ── Alternativo ─────────────────────────────────────────────────────────
+  [/alternati|^alternative$|post.?rock|math.?rock|folk(?!.*rock)|flamenco/, "alternativo"],
+
+  // ── Pop ─────────────────────────────────────────────────────────────────
+  [/k.?pop|kpop/,                                                          "pop"],
+  [/pop\s*(rock|latino|argentina?|argentino|tropical|urbano)/,             "pop"],
+  [/latin\s*pop|^pop$/,                                                    "pop"],
+
+  // ── Hip-Hop / Rap ────────────────────────────────────────────────────────
+  [/hip.?hop|^rap$|conscious.?hip/,                                        "hip-hop"],
+
+  // ── Urbano (trap + urban latin) ──────────────────────────────────────────
+  [/trap\s*latino|^trap$|urbano|urban\s*latin|freestyle|latin\s*trap/,    "urbano"],
+
+  // ── Reggaetón ───────────────────────────────────────────────────────────
+  [/reggaet|perreo|dembow/,                                                "reggaeton"],
+
+  // ── R&B ─────────────────────────────────────────────────────────────────
+  [/r\s*&\s*b|^r.b$|^rnb$|r\s*and\s*b|rhythm.?and.?blues|neo.?soul|^soul$|funk/, "r-b"],
+
+  // ── Jazz ────────────────────────────────────────────────────────────────
+  [/jazz\s*(fusion|latino|latin)?|^jazz$/,                                 "jazz"],
+  [/bossa\s*nova|smooth\s*jazz/,                                           "jazz"],
+
+  // ── Clásica ─────────────────────────────────────────────────────────────
+  [/clasic|classical|sinfon|orquest|filarmoni|camara|opera|barroco/,      "clasica"],
+
+  // ── Salsa / Tropical ────────────────────────────────────────────────────
+  [/salsa\s*(dura|romantica|brava)?|^salsa$|tropical|bachata|merengue|son\s*cubano/, "salsa"],
+
+  // ── Cumbia ──────────────────────────────────────────────────────────────
+  [/cumbia|cuarteto/,                                                      "cumbia"],
 ];
 
-// ─── inferGenres ──────────────────────────────────────────────────────────────
+// ─── mapToCanonicalGenre ──────────────────────────────────────────────────────
 
 /**
- * Infiere slugs de géneros a partir del nombre del evento (y opcionalmente del venue).
+ * Mapea una etiqueta de género raw (proveniente del scraper) al slug canónico.
  *
- * - Solo keyword matching: sin llamadas externas, sin LLM.
- * - Devuelve [] si no hay señal clara (enrich-artists lo resolverá después).
- * - Devuelve slugs únicos; el orden no está garantizado.
+ * - Función pura: sin I/O, sin efectos secundarios. Testeable en aislamiento.
+ * - Normaliza antes de comparar: lowercase + trim + sin tildes + sin paréntesis.
+ * - Retorna null si no hay mapeo canónico (evento/artista se guarda igual).
  *
  * @example
- *   inferGenres("Daddy Yankee Reggaeton Tour")   → ["reggaeton"]
- *   inferGenres("Armin van Buuren – Trance Set") → []   ← correcto, no hay regla de trance
- *   inferGenres("Festival Techno Rave 2026")     → ["techno", "electronica"]
+ *   mapToCanonicalGenre("EBM (Electronic Body Music)") → "electronica"
+ *   mapToCanonicalGenre("Motivacional / Conferencia")  → null
+ *   mapToCanonicalGenre("Hip-Hop/Rap")                 → "hip-hop"
+ *   mapToCanonicalGenre("R&B")                         → "r-b"
+ *   mapToCanonicalGenre("Urban Latin")                 → "urbano"
+ *   mapToCanonicalGenre("Nu Metal")                    → "metal"
+ *   mapToCanonicalGenre("Post-Punk")                   → "punk"
  */
-export function inferGenres(name: string, venue = ""): string[] {
-  const haystack = `${name} ${venue}`.toLowerCase();
-  const slugs    = new Set<string>();
+export function mapToCanonicalGenre(rawGenre: string): CanonicalGenreSlug | null {
+  const norm = normalizeGenreString(rawGenre);
+  if (!norm) return null;
 
-  for (const [re, slug] of GENRE_RULES) {
+  for (const [re, slug] of CANONICAL_MAP) {
+    if (re.test(norm)) return slug;
+  }
+  return null;
+}
+
+// ─── inferGenres ──────────────────────────────────────────────────────────────
+// Infiere géneros canónicos desde el nombre del evento (haystack matching).
+// Para cuando el scraper no provee etiquetas explícitas de género.
+
+const INFER_RULES: ReadonlyArray<[RegExp, CanonicalGenreSlug]> = [
+  [/electro|edm|\brave\b|circoloco|creamfields|awakenings|\bultra\b/,  "electronica"],
+  [/\btechno\b|\bhouse\b|tech\s*house|deep\s*house/,                   "electronica"],
+  [/reggaet|dembow|perreo/,                                            "reggaeton"],
+  [/hip[\s-]hop|\brap\b/,                                              "hip-hop"],
+  [/\btrap\b|\burbano\b|urban\s*latin/,                                "urbano"],
+  [/r\s*&\s*b|\brnb\b|\bsoul\b/,                                       "r-b"],
+  [/\bsalsa\b|tropical|bachata|merengue/,                              "salsa"],
+  [/cumbia/,                                                           "cumbia"],
+  [/\brock\b/,                                                         "rock"],
+  [/\bmetal\b|heavy\s*metal/,                                          "metal"],
+  [/\bpunk\b|hardcore/,                                                "punk"],
+  [/\bindie\b/,                                                        "indie"],
+  [/alternati|\bfolk\b|flamenco/,                                      "alternativo"],
+  [/k[\s-]?pop|kpop|\bpop\b/,                                          "pop"],
+  [/\bjazz\b|bossa\s*nova/,                                            "jazz"],
+  [/clasica|clasico|classical|sinfon|orquesta|filarmoni/,              "clasica"],
+];
+
+/**
+ * Infiere slugs canónicos desde el nombre del evento (haystack matching).
+ * Devuelve [] si no hay señal clara — sin LLM, sin I/O.
+ *
+ * @example
+ *   inferGenres("Daddy Yankee Reggaeton Tour")  → ["reggaeton"]
+ *   inferGenres("Festival Techno Rave 2026")    → ["electronica"]
+ */
+export function inferGenres(name: string, venue = ""): CanonicalGenreSlug[] {
+  const haystack = `${name} ${venue}`.toLowerCase();
+  const slugs    = new Set<CanonicalGenreSlug>();
+
+  for (const [re, slug] of INFER_RULES) {
     if (re.test(haystack)) slugs.add(slug);
   }
 
@@ -82,11 +189,7 @@ export function inferGenres(name: string, venue = ""): string[] {
 }
 
 // ─── linkGenres ───────────────────────────────────────────────────────────────
-//
-// Vincula slugs con la tabla event_genres.
-// Se exporta aquí para que todos los adapters lo usen sin duplicar.
-
-import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+// Vincula slugs canónicos con event_genres en una sola query (sin N+1).
 
 export async function linkGenres(
   supabase: SupabaseClient,
@@ -95,14 +198,13 @@ export async function linkGenres(
 ): Promise<void> {
   if (!slugs.length) return;
 
-  // Resuelve todos los genre_id en una sola query para evitar N+1
   const { data: genres, error } = await supabase
     .from("genres")
     .select("id, slug")
     .in("slug", slugs);
 
   if (error) {
-    console.error("[linkGenres] no se pudo consultar géneros:", error.message);
+    console.error("[linkGenres] query error:", error.message);
     return;
   }
 
@@ -115,6 +217,6 @@ export async function linkGenres(
     .upsert(rows, { onConflict: "event_id,genre_id", ignoreDuplicates: true });
 
   if (insertErr) {
-    console.error("[linkGenres] insert error:", insertErr.message);
+    console.error("[linkGenres] upsert error:", insertErr.message);
   }
 }

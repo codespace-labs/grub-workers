@@ -415,7 +415,7 @@ async function upsertEvent(event: TmEvent, countryCode = "PE"): Promise<UpsertOu
   if (row.external_slug) {
     const { data } = await supabase
         .from("events")
-        .select("id, price_min, price_max, venue_id")
+        .select("id, price_min, price_max, venue_id, is_active")
         .eq("external_slug", row.external_slug)
         .maybeSingle();
     existing = data;
@@ -425,7 +425,7 @@ async function upsertEvent(event: TmEvent, countryCode = "PE"): Promise<UpsertOu
   if (!existing) {
       const { data, error: selectError } = await supabase
         .from("events")
-        .select("id, price_min, price_max, venue_id")
+        .select("id, price_min, price_max, venue_id, is_active")
         .eq("ticket_url", row.ticket_url)
         .maybeSingle();
     if (selectError) throw new Error(`SELECT failed for ${row.ticket_url}: ${selectError.message}`);
@@ -439,6 +439,7 @@ async function upsertEvent(event: TmEvent, countryCode = "PE"): Promise<UpsertOu
         price_min: row.price_min ?? existing.price_min,
         price_max: row.price_max ?? existing.price_max,
         venue_id: row.venue_id ?? existing.venue_id,
+        is_active: existing.is_active,
       }
     : row;
 

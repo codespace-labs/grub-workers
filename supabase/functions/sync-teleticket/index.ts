@@ -1,7 +1,6 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { scrapeMarkdown }               from "../_shared/firecrawl.ts";
 import { inferGenres, linkGenres }      from "../_shared/genre-mapper.ts";
-import { isMusicalEvent }               from "../_shared/music-filter.ts";
 import {
   extractMinPriceFromMarkdown,
   emptySyncResult,
@@ -14,6 +13,11 @@ import {
   resolveEventLocation,
   stripTrailingCityFromEventName,
 } from "../_shared/location-normalization.ts";
+import {
+  buildSkippedNoChangeResult,
+  shouldSkipRecentNoChangeRun,
+} from "../_shared/sync-guard.ts";
+import { isExcludedEvent } from "../_shared/event-filter.ts";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -22,7 +26,8 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "
 
 const LISTING_URL      = "https://teleticket.com.pe/conciertos";
 const SOURCE           = "teleticket" as const;
-const SCRAPER_VERSION  = "2026-03-19.1";
+const SCRAPER_VERSION  = "2026-03-19.2";
+const NO_CHANGE_COOLDOWN_MINUTES = 20;
 
 /**
  * Máximo de páginas de detalle por run.
@@ -140,6 +145,12 @@ function parseListingMarkdown(markdown: string): ListingEvent[] {
   }
 
   return events;
+}
+
+function parseMaxPage(markdown: string): number {
+  const matches = [...markdown.matchAll(/data-page="(\d+)"/g)];
+  if (!matches.length) return 1;
+  return Math.max(...matches.map((match) => Number.parseInt(match[1], 10)));
 }
 
 // ─── Date parser ──────────────────────────────────────────────────────────────
@@ -261,7 +272,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
     // Buscar por ticket_url (clave de dedup para teleticket)
     const { data: existing, error: selErr } = await supabase
       .from("events")
-      .select("id, price_min, start_time, venue_id")
+      .select("id, price_min, start_time, venue_id, is_active")
       .eq("ticket_url", row.ticket_url)
       .maybeSingle();
 
@@ -276,6 +287,7 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
           price_min:  row.price_min  ?? existing.price_min,
           start_time: row.start_time ?? existing.start_time,
           venue_id:   row.venue_id   ?? existing.venue_id,
+          is_active:  existing.is_active,
         }
       : row;
 
@@ -298,7 +310,17 @@ async function upsertEvent(event: UnifiedEvent): Promise<UpsertOutcome> {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
+async function run(detailLimit = DETAIL_BATCH_LIMIT, options: { forceRefresh?: boolean } = {}): Promise<SyncResult> {
+  const guard = await shouldSkipRecentNoChangeRun(supabase, {
+    source: SOURCE,
+    cooldownMinutes: NO_CHANGE_COOLDOWN_MINUTES,
+    forceRefresh: options.forceRefresh,
+  });
+  if (guard.skip) {
+    console.log(`[sync-teleticket] skip sin cambios recientes (${guard.cooldownMinutes} min)`);
+    return buildSkippedNoChangeResult(SOURCE, guard);
+  }
+
   const result = emptySyncResult();
 
   console.log(`[sync-teleticket] version=${SCRAPER_VERSION}`);
@@ -306,6 +328,7 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
   // ── 1. Scrape listing (1 crédito) ─────────────────────────────────────────
   const { markdown } = await scrapeMarkdown(LISTING_URL, { waitFor: 2500 });
   const listings     = parseListingMarkdown(markdown);
+  const detectedPages = parseMaxPage(markdown);
 
   // Ventana de fechas:
   //   MIN_DATE  → enero 2026: histórico para que usuarios marquen eventos asistidos
@@ -319,7 +342,7 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
 
   const musicListings = listings.filter((e) => {
     if (e.category !== "Música") return false;
-    if (!isMusicalEvent(e.name, e.venue_raw ?? "")) return false;
+    if (isExcludedEvent(e.name, e.venue_raw, e.category)) return false;
     const date = parseSpanishDate(e.date_raw);
     if (!date) return false;
     return new Date(date) >= MIN_DATE;
@@ -339,10 +362,23 @@ async function run(detailLimit = DETAIL_BATCH_LIMIT): Promise<SyncResult> {
     `${listings.length - musicListings.length} descartados`,
   );
 
+  result.diagnostics = {
+    discovered: musicListings.length,
+    parsed: listings.length,
+    detail_fetched: 0,
+    skipped_reasons: {},
+    detected_pages: detectedPages,
+    future_listings: futureListings.length,
+    past_listings: pastListings.length,
+  };
+
   // ── 2. Enriquecer con páginas de detalle (1 crédito c/u) ──────────────────
   // Solo eventos FUTUROS reciben detalle (precio + hora).
   // Eventos pasados no lo necesitan — el usuario solo quiere marcar "fui a este".
   const toEnrich = futureListings.slice(0, detailLimit);
+  if (result.diagnostics) {
+    result.diagnostics.detail_fetched = toEnrich.length;
+  }
 
   const detailMap = new Map<string, DetailData>();
 
@@ -408,9 +444,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   try {
-    const body        = await req.json().catch(() => ({}));
+    const body        = await req.json().catch(() => ({})) as { detailLimit?: number; force_refresh?: boolean };
     const detailLimit = typeof body.detailLimit === "number" ? body.detailLimit : DETAIL_BATCH_LIMIT;
-    const result      = await run(detailLimit);
+    const result      = await run(detailLimit, { forceRefresh: body.force_refresh === true });
     return new Response(JSON.stringify(result), {
       status: 200, headers: { "Content-Type": "application/json" },
     });
