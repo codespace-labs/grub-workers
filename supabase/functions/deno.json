@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "test": "deno test --allow-env _tests/",
+    "test:unit": "deno test --allow-env _tests/unit/"
+  }
+}
